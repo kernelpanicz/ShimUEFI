@@ -1,10 +1,16 @@
 # WinToGo.Layout.psm1
 #
-# Partition layout arithmetic for the installation target.
+# Partition layout for the installation target.
 #
-# UEFI-only, GPT, three partitions: ESP, MSR, Windows. No MBR path is offered:
-# an MBR install cannot be booted by firmware in UEFI mode, and Windows To Go
-# media is UEFI in this project.
+# Two layouts exist:
+#
+#   Fresh      the target is a whole empty disk: GPT with ESP + MSR + Windows.
+#   SingleUsb  the target is the installer medium itself, so its GPT already
+#              carries ESP + MSR + an empty Windows partition from the build and
+#              only the Windows partition is formatted.
+#
+# UEFI-only, GPT only. An MBR install cannot be booted by UEFI firmware, and
+# offering it would produce media that appears to work and then does not.
 #
 # Copyright (C) 2026 ShimUEFI contributors
 # Licensed under the GNU GPL v3. See LICENSE.
@@ -22,25 +28,25 @@ $script:BackReserveBytes = 1MB
 function New-WtgLayoutPlan {
     <#
     .SYNOPSIS
-        Computes the GPT partition layout for a target disk.
+        Computes the GPT partition layout for a whole empty target disk.
+
+    .DESCRIPTION
+        Three partitions, no recovery partition. Windows Recovery Environment is
+        not configured by this project: nothing here wires a recovery partition
+        into reagentc, and shipping an empty one would only produce a partition
+        that looks useful and is not.
 
     .PARAMETER DiskSize
         Capacity of the target disk in bytes.
 
-    .PARAMETER WithRecovery
-        Adds a WinRE partition at the end. It is empty until the installed copy of
-        Windows enables recovery; see docs/ARCHITECTURE.md.
-
     .OUTPUTS
         Partitions[]  Name, Type, StartBytes, SizeBytes, SizeMB
-        Valid, Errors, TotalBytes, UnallocatedBytes
+        Valid, Errors, UnallocatedBytes
     #>
     param(
         [Parameter(Mandatory = $true)][long]$DiskSize,
         [int]$EspSizeMB = 512,
         [int]$MsrSizeMB = 16,
-        [int]$RecoverySizeMB = 1024,
-        [switch]$WithRecovery,
         [long]$MinimumWindowsBytes = 25GB,
         [int]$AlignmentBytes = 1MB
     )
@@ -57,10 +63,8 @@ function New-WtgLayoutPlan {
 
     $espBytes = [long]$EspSizeMB * $script:MiB
     $msrBytes = [long]$MsrSizeMB * $script:MiB
-    $recoveryBytes = 0L
-    if ($WithRecovery) { $recoveryBytes = [long]$RecoverySizeMB * $script:MiB }
 
-    $windowsBytes = $usable - $espBytes - $msrBytes - $recoveryBytes
+    $windowsBytes = $usable - $espBytes - $msrBytes
 
     if ($windowsBytes -lt $MinimumWindowsBytes) {
         $errors.Add(('a {0:N1} GB disk leaves only {1:N1} GB for Windows, which is below the {2:N0} GB minimum' -f `
@@ -98,11 +102,6 @@ function New-WtgLayoutPlan {
     $partitions.Add([pscustomobject]@{ Name = 'Windows'; Type = 'primary'; StartBytes = $cursor; SizeBytes = $windowsBytes;  SizeMB = [int][math]::Floor($windowsBytes / $script:MiB) })
     $cursor = & $align ($cursor + $windowsBytes) $AlignmentBytes
 
-    if ($WithRecovery) {
-        $partitions.Add([pscustomobject]@{ Name = 'Recovery'; Type = 'recovery'; StartBytes = $cursor; SizeBytes = $recoveryBytes; SizeMB = $RecoverySizeMB })
-        $cursor = $cursor + $recoveryBytes
-    }
-
     $unallocated = [long]$DiskSize - $cursor
 
     return [pscustomobject]@{
@@ -115,13 +114,85 @@ function New-WtgLayoutPlan {
     }
 }
 
+function Test-WtgSingleUsbTarget {
+    <#
+    .SYNOPSIS
+        Checks that a device really is the one a single-USB medium was built for.
+
+    .DESCRIPTION
+        A single-USB medium carries a GPT that only covers the device it was built
+        for, and a Windows partition sized to that device. Booting it on a larger
+        or smaller disk would leave the partition table describing space that does
+        not exist, so the declared size is compared against the real capacity and
+        any mismatch is refused rather than "repaired" by guessing.
+
+    .PARAMETER LayoutInfo
+        Contents of single-usb.json from the medium.
+
+    .OUTPUTS
+        Valid, Errors
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Disk,
+        $LayoutInfo,
+        [long]$ToleranceBytes = 1MB
+    )
+
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($null -eq $LayoutInfo) {
+        $errors.Add('this medium carries no single-USB layout description')
+        return [pscustomobject]@{ Valid = $false; Errors = $errors.ToArray() }
+    }
+
+    $declaredProperty = $LayoutInfo.PSObject.Properties['diskSizeBytes']
+    $declared = 0L
+    if ($null -ne $declaredProperty -and $null -ne $declaredProperty.Value) {
+        $declared = [long]$declaredProperty.Value
+    }
+
+    if ($declared -le 0) {
+        $errors.Add('the layout description on this medium declares no device size')
+        return [pscustomobject]@{ Valid = $false; Errors = $errors.ToArray() }
+    }
+
+    $sizeProperty = $Disk.PSObject.Properties['Size']
+    $actual = 0L
+    if ($null -ne $sizeProperty -and $null -ne $sizeProperty.Value) { $actual = [long]$sizeProperty.Value }
+
+    if ($actual -le 0) {
+        $errors.Add('the device reports no capacity')
+    }
+    else {
+        $difference = [math]::Abs($actual - $declared)
+        if ($difference -gt $ToleranceBytes) {
+            $errors.Add(('this device is {0} bytes but the medium was built for {1} bytes; rebuild it with --disk-size {0}' -f $actual, $declared))
+        }
+    }
+
+    $windowsProperty = $LayoutInfo.PSObject.Properties['windowsPartition']
+    $windowsPartition = 3
+    if ($null -ne $windowsProperty -and $null -ne $windowsProperty.Value) { $windowsPartition = [int]$windowsProperty.Value }
+    if ($windowsPartition -lt 1) {
+        $errors.Add('the layout description names no Windows partition')
+    }
+
+    return [pscustomobject]@{
+        Valid            = ($errors.Count -eq 0)
+        Errors           = $errors.ToArray()
+        DiskSize         = $declared
+        WindowsPartition = $windowsPartition
+    }
+}
+
 function Format-WtgLayout {
     <#
     .SYNOPSIS
         Renders a layout plan as a table for the confirmation screen.
     #>
-    param([Parameter(Mandatory = $true)]$Plan)
+    param($Plan = $null)
 
+    if ($null -eq $Plan) { return '  (single-USB device: existing partitions are reused)' }
     if (-not $Plan.Valid) { return ($Plan.Errors -join [Environment]::NewLine) }
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
@@ -132,4 +203,4 @@ function Format-WtgLayout {
     return ($lines -join [Environment]::NewLine)
 }
 
-Export-ModuleMember -Function @('New-WtgLayoutPlan', 'Format-WtgLayout')
+Export-ModuleMember -Function @('New-WtgLayoutPlan', 'Test-WtgSingleUsbTarget', 'Format-WtgLayout')

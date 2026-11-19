@@ -37,6 +37,8 @@ unattended_index=""
 driver_dir=""
 allow_sd_card=0
 allow_internal_override=0
+single_usb=0
+disk_size=""
 keep_work=0
 
 info()  { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -66,6 +68,12 @@ Media contents:
                            Let the installer offer internal-bus disks (NVMe/SATA
                            enclosures) after the operator confirms the serial
 
+Single device:
+  --single-usb             Build one image that is both the installer and the
+                           Windows target, so a single USB drive is enough
+  --disk-size SIZE         Size of that device, in bytes or with a K/M/G suffix.
+                           Must match the device exactly; the installer checks it
+
 Unattended (still requires the serial number):
   --unattended-disk N      Default target disk number
   --unattended-serial S    Serial number of the target disk
@@ -94,6 +102,8 @@ while [ $# -gt 0 ]; do
         --driver-dir)       driver_dir="$2"; shift 2 ;;
         --allow-sd-card)    allow_sd_card=1; shift ;;
         --allow-internal-bus-override) allow_internal_override=1; shift ;;
+        --single-usb)       single_usb=1; shift ;;
+        --disk-size)        disk_size="$2"; shift 2 ;;
         --unattended-disk)  unattended_disk="$2"; shift 2 ;;
         --unattended-serial) unattended_serial="$2"; shift 2 ;;
         --unattended-index) unattended_index="$2"; shift 2 ;;
@@ -122,14 +132,26 @@ if [ -n "$unattended_disk" ] && [ -z "$unattended_serial" ]; then
     die "--unattended-disk needs --unattended-serial (the installer refuses a disk number alone)"
 fi
 
+# --single-usb needs to write a GPT over a regular file, which sgdisk can do
+# without root and without loop devices.
+if [ -n "$disk_size" ] || [ "$single_usb" -eq 1 ]; then
+    single_usb=1
+fi
+if [ "$single_usb" -eq 1 ] && [ -z "$disk_size" ]; then
+    die "--single-usb needs --disk-size (the exact capacity of the device, e.g. --disk-size 64023257088)"
+fi
+
 need_tools="xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir truncate dd sha256sum du awk"
+if [ "$single_usb" -eq 1 ]; then
+    need_tools="$need_tools sgdisk"
+fi
 missing=""
 for tool in $need_tools; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 if [ -n "$missing" ]; then
     die "missing build tools:$missing
-On Debian/Ubuntu: sudo apt install xorriso wimtools mtools dosfstools coreutils"
+On Debian/Ubuntu: sudo apt install xorriso wimtools mtools dosfstools gdisk coreutils"
 fi
 
 # ---------------------------------------------------------------------------
@@ -207,6 +229,37 @@ if [ -n "$driver_dir" ]; then
     mkdir -p "$work_dir/stage/drivers"
     cp -r "$driver_dir"/. "$work_dir/stage/drivers/"
     info "extra drivers copied to /drivers"
+fi
+
+# A single-USB medium describes the device it was built for, so the installer can
+# refuse to run on anything else.
+to_bytes() {
+    local value="$1"
+    case "$value" in
+        *[kK]) printf '%s' $(( ${value%?} * 1024 )) ;;
+        *[mM]) printf '%s' $(( ${value%?} * 1024 * 1024 )) ;;
+        *[gG]) printf '%s' $(( ${value%?} * 1024 * 1024 * 1024 )) ;;
+        *[tT]) printf '%s' $(( ${value%?} * 1024 * 1024 * 1024 * 1024 )) ;;
+        *)      printf '%s' "$value" ;;
+    esac
+}
+
+if [ "$single_usb" -eq 1 ]; then
+    disk_bytes="$(to_bytes "$disk_size")"
+    case "$disk_bytes" in
+        ''|*[!0-9]*) die "--disk-size must be a number of bytes, or a number with a K/M/G suffix" ;;
+    esac
+    cat > "$work_dir/payload/wintogo/single-usb.json" <<EOF
+{
+  "schema": 1,
+  "diskSizeBytes": $disk_bytes,
+  "espPartition": 1,
+  "msrPartition": 2,
+  "windowsPartition": 3,
+  "espOffsetBytes": 1048576
+}
+EOF
+    info "single-USB layout recorded for a $disk_bytes byte device"
 fi
 
 # Any of these options is expressed as an answer file on the medium. The disk
@@ -308,7 +361,9 @@ tree_size_mb=$(( $(du -sm "$work_dir/stage" | awk '{print $1}') ))
 if [ "$esp_size_mb" -eq 0 ]; then
     esp_size_mb=$(( tree_size_mb + 96 ))
     # FAT32 needs a sane minimum and room for the FATs on larger volumes.
-    [ "$esp_size_mb" -lt 768 ] && esp_size_mb=768
+    if [ "$esp_size_mb" -lt 768 ]; then
+        esp_size_mb=768
+    fi
     esp_size_mb=$(( ((esp_size_mb + esp_size_mb / 50 + 15) / 16) * 16 ))
 fi
 info "FAT32 volume size: $esp_size_mb MiB for $tree_size_mb MiB of files"
@@ -342,9 +397,34 @@ if ! mdir -i "$fat_image" '::/sources' 2>/dev/null | grep -qi 'install\.'; then
     die "the Windows installation image is missing from /sources"
 fi
 
-image_out="$out_dir/shimuefi-installer.img"
-mv -f "$fat_image" "$image_out"
-info "wrote $image_out"
+if [ "$single_usb" -eq 1 ]; then
+    step "building the single-USB disk image"
+
+    if [ "$disk_bytes" -le $(( (esp_size_mb + 32) * 1024 * 1024 )) ]; then
+        die "--disk-size is too small for a ${esp_size_mb} MiB EFI partition plus MSR"
+    fi
+
+    # p1 ESP at 1 MiB (sector 2048), p2 MSR, p3 the rest as an empty Windows
+    # partition. The ESP file is written straight onto p1: no loop device, no root.
+    image_out="$out_dir/shimuefi-single-usb.img"
+    rm -f "$image_out"
+    truncate -s "$disk_bytes" "$image_out"
+
+    sgdisk --clear --set-alignment=2048 \
+        -n "1:2048:+${esp_size_mb}M" -t "1:EF00" -c "1:SYSTEM" \
+        -n "2:0:+16M"             -t "2:0C01" -c "2:MSR" \
+        -n "3:0:0"                -t "3:0700" -c "3:WINDOWS" \
+        "$image_out" >/dev/null
+
+    dd if="$fat_image" of="$image_out" bs=1M seek=1 conv=notrunc status=none
+    rm -f "$fat_image"
+
+    info "wrote $image_out ($disk_bytes bytes, ESP at 1 MiB)"
+else
+    image_out="$out_dir/shimuefi-installer.img"
+    mv -f "$fat_image" "$image_out"
+    info "wrote $image_out"
+fi
 
 # ---------------------------------------------------------------------------
 # Optional ISO
@@ -390,13 +470,18 @@ manifest="$out_dir/manifest.txt"
     echo "boot image:   $boot_wim_path"
     echo "windows image: $install_image_path -> $install_image_name"
     echo "volume label: $volume_name"
+    if [ "$single_usb" -eq 1 ]; then
+        echo "mode:         single USB ($disk_bytes bytes: ESP + MSR + Windows)"
+    else
+        echo "mode:         installer medium (needs a second external disk as target)"
+    fi
     if [ -n "$unattended_disk" ]; then
         echo "unattended:   disk $unattended_disk (serial confirmed at build time)"
     else
         echo "unattended:   no (interactive)"
     fi
     echo
-    echo "checksums"
+    echo "checksums (sha256):"
     ( cd "$out_dir" && sha256sum ./*.img ./*.iso 2>/dev/null || true )
     echo
     echo "contents (top level of /sources and /EFI)"
@@ -413,7 +498,21 @@ if [ "$keep_work" -eq 0 ]; then
 fi
 
 step "done"
-cat <<EOF
+if [ "$single_usb" -eq 1 ]; then
+    cat <<EOF
+
+Write the image to the USB device that will become the Windows disk (Linux):
+
+  sudo dd if=$image_out of=/dev/sdX bs=4M oflag=direct status=progress conv=fsync
+
+Replace /dev/sdX with the whole device, not a partition. This erases that drive.
+
+A single device is enough: boot it and the installer formats its own Windows
+partition in place. The image was built for exactly $disk_bytes bytes, so write
+it to a device of exactly that size or the installer will refuse to run.
+EOF
+else
+    cat <<EOF
 
 Write the image to a USB drive (Linux):
 
@@ -422,5 +521,7 @@ Write the image to a USB drive (Linux):
 Replace /dev/sdX with the whole device, not a partition. This erases that drive.
 
 The medium installs Windows onto a *second* external disk. Do not write this
-image to the disk you intend to install Windows onto.
+image to the disk you intend to install Windows onto. If you only have one USB
+drive, rebuild with --single-usb --disk-size <bytes of that drive>.
 EOF
+fi

@@ -150,28 +150,73 @@ function New-WtgDiskpartScript {
     return ($lines -join [Environment]::NewLine) + [Environment]::NewLine
 }
 
+function New-WtgSingleUsbDiskpartScript {
+    <#
+    .SYNOPSIS
+        Generates the diskpart script used when the installer medium is also the
+        installation target.
+
+    .DESCRIPTION
+        Pure function. The device already carries ESP + MSR + an empty Windows
+        partition from the build, so nothing is cleaned and no partition is
+        created: the installer payload lives on the ESP of this very disk, and
+        wiping the table would destroy it mid-install. Only the Windows partition
+        is formatted.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [int]$WindowsPartitionNumber = 3
+    )
+
+    if ($WindowsPartitionNumber -lt 1) {
+        throw 'WTG-INSTALL: single-USB mode needs a valid Windows partition number'
+    }
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $lines.Add('rem ShimUEFI portable Windows - single-USB install')
+    $lines.Add('rem The partition table and the installer payload are preserved.')
+    $lines.Add(('select disk {0}' -f $DiskNumber))
+    $lines.Add(('select partition {0}' -f $WindowsPartitionNumber))
+    $lines.Add('format quick fs=ntfs label="WINDOWS"')
+    $lines.Add('exit')
+
+    return ($lines -join [Environment]::NewLine) + [Environment]::NewLine
+}
+
 function Invoke-WtgPartition {
     <#
     .SYNOPSIS
-        Wipes and partitions the authorized disk.
+        Partitions the authorized disk: either a fresh whole disk, or the Windows
+        partition of a single-USB medium.
     #>
     param(
         [Parameter(Mandatory = $true)]$Disk,
         [Parameter(Mandatory = $true)]$Authorization,
         [Parameter(Mandatory = $true)]$Policy,
-        [Parameter(Mandatory = $true)]$Layout,
+        $Layout = $null,
         [Parameter(Mandatory = $true)][string]$WorkDirectory,
+        [ValidateSet('Fresh', 'SingleUsb')][string]$Mode = 'Fresh',
+        [int]$WindowsPartitionNumber = 3,
         [string]$JournalPath
     )
 
     Assert-WtgDiskWritable -Authorization $Authorization -Disk $Disk -Policy $Policy | Out-Null
+
+    if ($Mode -eq 'SingleUsb' -and $Disk.PartitionStyle -ne 'GPT') {
+        throw ('WTG-INSTALL: single-USB mode needs a GPT device, but disk {0} reports {1}' -f $Disk.Number, $Disk.PartitionStyle)
+    }
 
     if (-not (Test-Path -LiteralPath $WorkDirectory)) {
         New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
     }
 
     $scriptPath = Join-Path $WorkDirectory 'partition.txt'
-    $scriptText = New-WtgDiskpartScript -Layout $Layout -DiskNumber $Authorization.DiskNumber
+    if ($Mode -eq 'SingleUsb') {
+        $scriptText = New-WtgSingleUsbDiskpartScript -DiskNumber $Authorization.DiskNumber -WindowsPartitionNumber $WindowsPartitionNumber
+    }
+    else {
+        $scriptText = New-WtgDiskpartScript -Layout $Layout -DiskNumber $Authorization.DiskNumber
+    }
     Set-Content -LiteralPath $scriptPath -Value $scriptText -Encoding ASCII
 
     Invoke-WtgExternal -FilePath 'diskpart.exe' -Arguments @('/s', $scriptPath) -JournalPath $JournalPath -Description 'partition target disk' | Out-Null
@@ -462,6 +507,50 @@ function Set-WtgOfflinePortableSettings {
 # Verification
 # ---------------------------------------------------------------------------
 
+function Confirm-WtgFallbackLoader {
+    <#
+    .SYNOPSIS
+        Ensures \EFI\Boot\BOOTX64.EFI exists on the target ESP.
+
+    .DESCRIPTION
+        Firmware fallback paths vary between vendors, and a disk that only has
+        \EFI\Microsoft\Boot\bootmgfw.efi is invisible to some of them. bcdboot
+        creates the fallback copy on most builds but not reliably on all, so it is
+        verified and copied from bootmgfw.efi when missing.
+
+    .OUTPUTS
+        bool - true when the loader is present afterwards.
+
+    .NOTES
+        Best effort by design: the caller does not abort on false, because
+        Test-WtgInstallation independently requires the same file and is the one
+        authority on whether the target is bootable.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$EspDriveLetter,
+        [string]$JournalPath
+    )
+
+    $espRoot = $EspDriveLetter + ':'
+    $fallback = $espRoot + '\EFI\Boot\BOOTX64.EFI'
+    if (Test-Path -LiteralPath $fallback) { return $true }
+
+    $bootManager = $espRoot + '\EFI\Microsoft\Boot\bootmgfw.efi'
+    if (-not (Test-Path -LiteralPath $bootManager)) { return $false }
+
+    $fallbackDirectory = $espRoot + '\EFI\Boot'
+    if (-not (Test-Path -LiteralPath $fallbackDirectory)) {
+        New-Item -ItemType Directory -Path $fallbackDirectory -Force | Out-Null
+    }
+    Copy-Item -LiteralPath $bootManager -Destination $fallback -Force
+
+    if ($JournalPath) {
+        Add-WtgJournal -Path $JournalPath -Event 'fallback-loader' -Message 'copied bootmgfw.efi to \EFI\Boot\BOOTX64.EFI'
+    }
+
+    return (Test-Path -LiteralPath $fallback)
+}
+
 function Test-WtgInstallation {
     <#
     .SYNOPSIS
@@ -530,7 +619,8 @@ function Invoke-WtgInstall {
         [string]$DriverDirectory,
         [string]$JournalPath,
         [string]$OperatingSystemLocale = 'en-us',
-        [switch]$WithRecovery,
+        [ValidateSet('Fresh', 'SingleUsb')][string]$Mode = 'Fresh',
+        [int]$WindowsPartitionNumber = 3,
         [scriptblock]$OnProgress,
         # Seam for tests: resolves the ESP and Windows drive letters after
         # partitioning. Defaults to the real volume discovery.
@@ -555,25 +645,46 @@ function Invoke-WtgInstall {
 
     # ---- stage 2: plan the layout -------------------------------------------
     & $report 'layout' 6 'Planning the partition layout'
-    $layout = New-WtgLayoutPlan -DiskSize ([long]$Disk.Size) -WithRecovery:$WithRecovery
-    if (-not $layout.Valid) {
-        throw ('WTG-INSTALL: the target disk is too small or the layout is invalid: ' + ($layout.Errors -join '; '))
+    if ($Mode -eq 'SingleUsb') {
+        # The device is already partitioned by the build; only its capacity is
+        # worth checking, because a too-small device cannot hold Windows.
+        if ([long]$Disk.Size -lt [long]$Policy.MinimumTargetBytes) {
+            throw ('WTG-INSTALL: this device is smaller than the {0:N0} GB minimum for Windows' -f ($Policy.MinimumTargetBytes / 1GB))
+        }
+        $layout = $null
+    }
+    else {
+        $layout = New-WtgLayoutPlan -DiskSize ([long]$Disk.Size)
+        if (-not $layout.Valid) {
+            throw ('WTG-INSTALL: the target disk is too small or the layout is invalid: ' + ($layout.Errors -join '; '))
+        }
     }
 
     if ($JournalPath) {
+        $layoutDescription = @()
+        if ($null -ne $layout) {
+            $layoutDescription = @($layout.Partitions | ForEach-Object { @{ name = $_.Name; mb = $_.SizeMB } })
+        }
         Add-WtgJournal -Path $JournalPath -Event 'install-begin' -Message 'starting installation' -Data @{
             disk    = $Authorization.DiskNumber
             serial  = $Authorization.SerialNumber
             image   = $ImagePath
             index   = $ImageIndex
-            layout  = @($layout.Partitions | ForEach-Object { @{ name = $_.Name; mb = $_.SizeMB } })
+            mode    = $Mode
+            layout  = $layoutDescription
         }
     }
 
     # ---- stage 3: partition --------------------------------------------------
-    & $report 'partition' 12 'Wiping and partitioning the selected device'
+    if ($Mode -eq 'SingleUsb') {
+        & $report 'partition' 12 'Formatting the Windows partition on the selected device'
+    }
+    else {
+        & $report 'partition' 12 'Wiping and partitioning the selected device'
+    }
     Invoke-WtgPartition -Disk $Disk -Authorization $Authorization -Policy $Policy `
-        -Layout $layout -WorkDirectory $WorkDirectory -JournalPath $JournalPath | Out-Null
+        -Layout $layout -WorkDirectory $WorkDirectory -Mode $Mode `
+        -WindowsPartitionNumber $WindowsPartitionNumber -JournalPath $JournalPath | Out-Null
 
     & $report 'partition' 20 'Waiting for the new volumes'
     if ($null -eq $VolumeResolver) {
@@ -609,6 +720,15 @@ function Invoke-WtgInstall {
     & $report 'boot' 80 'Writing Windows Boot Manager to the target ESP'
     Invoke-WtgBcdboot -WindowsDriveLetter $volumes.WindowsDriveLetter `
         -EspDriveLetter $volumes.EspDriveLetter -Locale $OperatingSystemLocale -JournalPath $JournalPath | Out-Null
+
+    # bcdboot may leave \EFI\Boot\BOOTX64.EFI absent; without it many firmware boot
+    # menus cannot find the disk at all, so it is placed explicitly.
+    if (-not (Confirm-WtgFallbackLoader -EspDriveLetter $volumes.EspDriveLetter -JournalPath $JournalPath)) {
+        # Deliberately not fatal here. Test-WtgInstallation is the single place
+        # that decides whether the target can boot, and it requires this file, so
+        # a failed copy surfaces there instead of as a second, weaker verdict.
+        & $report 'boot' 82 'could not place the EFI fallback loader; verification will report it'
+    }
 
     # ---- stage 6: portable settings -----------------------------------------
     & $report 'portable' 88 'Configuring portable-OS settings'
@@ -647,6 +767,7 @@ Export-ModuleMember -Function @(
     'Get-WtgCommandExecutor',
     'Invoke-WtgExternal',
     'New-WtgDiskpartScript',
+    'New-WtgSingleUsbDiskpartScript',
     'Invoke-WtgPartition',
     'Get-WtgTargetVolumes',
     'ConvertFrom-WtgWimInfo',
@@ -654,6 +775,7 @@ Export-ModuleMember -Function @(
     'Invoke-WtgApplyImage',
     'Invoke-WtgAddDrivers',
     'Invoke-WtgBcdboot',
+    'Confirm-WtgFallbackLoader',
     'New-WtgRegistryOperations',
     'Set-WtgOfflinePortableSettings',
     'Test-WtgInstallation',

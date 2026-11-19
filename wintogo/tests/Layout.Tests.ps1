@@ -4,6 +4,8 @@
 $engine = Join-Path (Split-Path -Parent $PSScriptRoot) 'engine'
 Import-Module (Join-Path $engine 'WinToGo.Layout.psm1') -Force
 
+# Test-WtgSingleUsbTarget takes a plain disk record; _assert.ps1 provides one.
+
 Test-Case 'a typical 1 TB layout fits inside the disk' {
     $plan = New-WtgLayoutPlan -DiskSize 1000GB
     Assert-True $plan.Valid ($plan.Errors -join '; ')
@@ -54,13 +56,44 @@ Test-Case 'unreasonable alignment is rejected' {
     Assert-False $plan.Valid
 }
 
-Test-Case 'the recovery partition is only added on request' {
-    $without = New-WtgLayoutPlan -DiskSize 256GB
-    Assert-Equal 3 $without.Partitions.Count
-    $with = New-WtgLayoutPlan -DiskSize 256GB -WithRecovery
-    Assert-Equal 4 $with.Partitions.Count
-    Assert-Equal 'Recovery' $with.Partitions[3].Name
-    Assert-True ($with.UnallocatedBytes -ge 0)
+Test-Case 'there is no recovery partition option' {
+    # A recovery partition that nothing wires into reagentc would be decoration.
+    $command = Get-Command New-WtgLayoutPlan
+    Assert-False ($command.Parameters.ContainsKey('WithRecovery')) 'WithRecovery must not exist'
+    $plan = New-WtgLayoutPlan -DiskSize 256GB
+    Assert-Equal 3 $plan.Partitions.Count
+    foreach ($partition in $plan.Partitions) {
+        Assert-True ($partition.Name -ne 'Recovery') 'no Recovery partition may be planned'
+    }
+    Assert-True ($plan.UnallocatedBytes -ge 0)
+}
+
+Test-Case 'a single-USB target matches the device it was built for' {
+    $disk = New-TestDisk -Size 256GB
+    $info = [pscustomobject]@{ diskSizeBytes = 256GB; windowsPartition = 3 }
+    $result = Test-WtgSingleUsbTarget -Disk $disk -LayoutInfo $info
+    Assert-True $result.Valid ($result.Errors -join '; ')
+    Assert-Equal 3 $result.WindowsPartition
+}
+
+Test-Case 'a single-USB target refuses a device that is not the declared size' {
+    $disk = New-TestDisk -Size 128GB
+    $info = [pscustomobject]@{ diskSizeBytes = 256GB; windowsPartition = 3 }
+    $result = Test-WtgSingleUsbTarget -Disk $disk -LayoutInfo $info
+    Assert-False $result.Valid
+    Assert-True (($result.Errors -join ' ') -match 'rebuild it with --disk-size') 'the error must say how to fix it'
+}
+
+Test-Case 'a single-USB target refuses a medium with no layout description' {
+    $result = Test-WtgSingleUsbTarget -Disk (New-TestDisk) -LayoutInfo $null
+    Assert-False $result.Valid
+    Assert-True (($result.Errors -join ' ') -match 'no single-USB layout description')
+}
+
+Test-Case 'a single-USB target refuses a description with no size' {
+    $info = [pscustomobject]@{ windowsPartition = 3 }
+    $result = Test-WtgSingleUsbTarget -Disk (New-TestDisk -Size 256GB) -LayoutInfo $info
+    Assert-False $result.Valid
 }
 
 Test-Case 'the rendered layout mentions every partition' {
@@ -69,6 +102,11 @@ Test-Case 'the rendered layout mentions every partition' {
     Assert-Contains $text 'EFI'
     Assert-Contains $text 'MSR'
     Assert-Contains $text 'Windows'
+}
+
+Test-Case 'a null layout renders an explanation instead of failing' {
+    $text = Format-WtgLayout -Plan $null
+    Assert-Contains $text 'single-USB'
 }
 
 Complete-WtgTestRun 'Layout.Tests'

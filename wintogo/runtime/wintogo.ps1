@@ -32,6 +32,9 @@ param(
     [string]$DriverDirectory = '',
     [switch]$AllowSdCard,
     [switch]$AllowInternalBusOverride,
+    # Install onto the installer medium itself. Detected automatically from a
+    # single-USB medium; this switch exists for starting it by hand.
+    [switch]$SingleUsb,
     [switch]$Yes,
     [switch]$DryRun,
     [string]$LogPath = '',
@@ -118,6 +121,20 @@ Import-Module (Join-Path $script:EngineRoot 'WinToGo.Layout.psm1')  -Force
 Import-Module (Join-Path $script:EngineRoot 'WinToGo.Install.psm1') -Force
 
 $policy = New-WtgStoragePolicy -AllowSdCards:$AllowSdCard -AllowInternalBusOverride:$AllowInternalBusOverride
+
+# A single-USB medium carries a description of the device it was built for. Its
+# presence switches the installer into single-device mode.
+$script:SingleUsbInfo = $null
+$singleUsbLayoutFile = Join-Path $PSScriptRoot 'single-usb.json'
+if (Test-Path -LiteralPath $singleUsbLayoutFile) {
+    try {
+        $script:SingleUsbInfo = Get-Content -LiteralPath $singleUsbLayoutFile -Raw | ConvertFrom-Json
+        $SingleUsb = $true
+    }
+    catch {
+        Exit-Fatal 'the single-USB layout description on this medium is unreadable'
+    }
+}
 
 # An unattended answer file shipped on the medium: X:\wintogo\unattended.json
 if (-not $UnattendedFile) {
@@ -289,21 +306,46 @@ if ($null -eq $imageSet) {
 Write-Note ('image  ' + $imageSet.ImagePath)
 Write-Note ('source disk ' + $imageSet.DiskNumber + ' (this medium - it will be made read-only)')
 
-# Remove the medium from the candidate list: overwriting the running installer's
-# own disk mid-install is not recoverable.
-$before = $candidates.Count
-$filtered = @($candidates | Where-Object { $_.Disk.Number -ne $imageSet.DiskNumber })
-$candidates = New-Object 'System.Collections.Generic.List[object]'
-for ($i = 0; $i -lt $filtered.Count; $i++) {
-    $entry = $filtered[$i]
-    $candidates.Add([pscustomobject]@{ Disk = $entry.Disk; Index = $i + 1; Eligibility = $entry.Eligibility })
-}
-if ($candidates.Count -lt $before) {
-    Write-Warn 'the disk holding this installer was removed from the list of targets'
-}
+$script:SingleUsbCheck = $null
 
-if ($candidates.Count -eq 0) {
-    Exit-Fatal 'the only removable disk is the installer medium itself; connect a second external disk'
+if ($SingleUsb) {
+    # Single-USB mode: the target is the device the installer booted from. Its GPT
+    # and its ESP (which holds the installation image) are preserved; only the
+    # pre-created Windows partition is formatted.
+    $own = @($candidates | Where-Object { $_.Disk.Number -eq $imageSet.DiskNumber })
+    if ($own.Count -eq 0) {
+        Exit-Fatal 'this medium was built for single-USB use, but its own device is not an eligible target; the device may not report a serial number'
+    }
+
+    $script:SingleUsbCheck = Test-WtgSingleUsbTarget -Disk $own[0].Disk -LayoutInfo $script:SingleUsbInfo
+    if (-not $script:SingleUsbCheck.Valid) {
+        Exit-Fatal ('this device cannot use the medium as built: ' + ($script:SingleUsbCheck.Errors -join '; '))
+    }
+
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    $candidates.Add([pscustomobject]@{ Disk = $own[0].Disk; Index = 1; Eligibility = $own[0].Eligibility })
+
+    Write-Host ''
+    Write-Warn 'single-USB mode: Windows will be installed onto this installer device itself'
+    Write-Note 'the partition table and the EFI partition holding the image are preserved'
+}
+else {
+    # Remove the medium from the candidate list: overwriting the running installer's
+    # own disk mid-install is not recoverable.
+    $before = $candidates.Count
+    $filtered = @($candidates | Where-Object { $_.Disk.Number -ne $imageSet.DiskNumber })
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    for ($i = 0; $i -lt $filtered.Count; $i++) {
+        $entry = $filtered[$i]
+        $candidates.Add([pscustomobject]@{ Disk = $entry.Disk; Index = $i + 1; Eligibility = $entry.Eligibility })
+    }
+    if ($candidates.Count -lt $before) {
+        Write-Warn 'the disk holding this installer was removed from the list of targets'
+    }
+
+    if ($candidates.Count -eq 0) {
+        Exit-Fatal 'the only removable disk is the installer medium itself; connect a second external disk, or build the medium with --single-usb'
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -421,12 +463,19 @@ else {
 Write-Host ('  selected: ' + $chosenEdition.Name) -ForegroundColor Green
 
 Write-Step 'Partition layout for this device'
-$layout = New-WtgLayoutPlan -DiskSize ([long]$target.Size)
-if (-not $layout.Valid) {
-    Exit-Fatal ('this device is too small: ' + ($layout.Errors -join '; '))
+if ($SingleUsb) {
+    Write-Note 'reusing the existing EFI system partition and MSR on this device'
+    Write-Note ('partition {0} becomes Windows (NTFS)' -f $script:SingleUsbCheck.WindowsPartition)
+    Write-Note 'the installer image stays on the EFI partition, so a failed run can be retried'
 }
-Write-Host (Format-WtgLayout -Plan $layout)
-Write-Note ('unallocated at the end: ' + [math]::Round($layout.UnallocatedBytes / 1MB, 1) + ' MiB (backup partition table)')
+else {
+    $layout = New-WtgLayoutPlan -DiskSize ([long]$target.Size)
+    if (-not $layout.Valid) {
+        Exit-Fatal ('this device is too small: ' + ($layout.Errors -join '; '))
+    }
+    Write-Host (Format-WtgLayout -Plan $layout)
+    Write-Note ('unallocated at the end: ' + [math]::Round($layout.UnallocatedBytes / 1MB, 1) + ' MiB (backup partition table)')
+}
 
 # ---------------------------------------------------------------------------
 # Step 6: storage protection
@@ -517,10 +566,17 @@ $progress = {
 
 $result = $null
 try {
+    $installMode = 'Fresh'
+    $windowsPartitionNumber = 3
+    if ($SingleUsb) {
+        $installMode = 'SingleUsb'
+        $windowsPartitionNumber = $script:SingleUsbCheck.WindowsPartition
+    }
+
     $result = Invoke-WtgInstall -Disk $target -Authorization $authorization -Policy $policy `
         -ImagePath $imageSet.ImagePath -SwmPath $imageSet.SwmPath -ImageIndex $chosenEdition.Index `
         -WorkDirectory $workDirectory -DriverDirectory $DriverDirectory -JournalPath $LogPath `
-        -OnProgress $progress
+        -Mode $installMode -WindowsPartitionNumber $windowsPartitionNumber -OnProgress $progress
 }
 catch {
     Write-Host ''
@@ -555,9 +611,15 @@ Write-Head 'Installation complete'
 Write-Host '  Windows is installed on the external disk and is independently bootable.' -ForegroundColor Green
 Write-Host ''
 Write-Host '  Next steps' -ForegroundColor White
-Write-Host '    1. Remove the installer medium.'
-Write-Host '    2. Keep the external disk connected and reboot this computer, choosing the'
-Write-Host '       external disk in the one-time boot menu (usually F12, F9, F10 or Esc).'
+if ($SingleUsb) {
+    Write-Host '    1. Keep this device connected and reboot, choosing it in the one-time boot'
+    Write-Host '       menu (usually F12, F9, F10 or Esc).'
+}
+else {
+    Write-Host '    1. Remove the installer medium.'
+    Write-Host '    2. Keep the external disk connected and reboot this computer, choosing the'
+    Write-Host '       external disk in the one-time boot menu (usually F12, F9, F10 or Esc).'
+}
 Write-Host '    3. Windows will finish setup (language, account, licence) on first boot.'
 Write-Host '    4. On another computer, use that computer''s boot menu to pick the disk.'
 Write-Host ''

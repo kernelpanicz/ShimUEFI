@@ -60,6 +60,37 @@ Test-Case 'the diskpart script targets exactly one disk and builds an ESP/MSR/pr
     Assert-Equal 1 $selects
 }
 
+Test-Case 'the single-USB script formats only the Windows partition' {
+    $script = New-WtgSingleUsbDiskpartScript -DiskNumber 2 -WindowsPartitionNumber 3
+
+    Assert-Contains $script 'select disk 2'
+    Assert-Contains $script 'select partition 3'
+    Assert-Contains $script 'format quick fs=ntfs'
+
+    # The installer payload lives on this disk's ESP: wiping the table would
+    # destroy the installation image mid-run.
+    Assert-NotContains $script 'clean'
+    Assert-NotContains $script 'convert gpt'
+    Assert-NotContains $script 'create partition efi'
+    Assert-NotContains $script 'create partition msr'
+    Assert-Equal 1 ([regex]::Matches($script, '(?im)^\s*select\s+disk')).Count
+}
+
+Test-Case 'single-USB partitioning refuses a device that is not GPT' {
+    Reset-RecordedCalls
+    $auth = New-TestAuthorization
+    $mbr = New-TestDisk -Number 1 -BusType 7 -SerialNumber 'S6T7TEST0001234' -Size 1000GB -PartitionStyle 'MBR'
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-test-' + [guid]::NewGuid().ToString('N'))
+
+    Assert-Throws -Body {
+        Invoke-WtgPartition -Disk $mbr -Authorization $auth -Policy $policy -WorkDirectory $work `
+            -Mode SingleUsb -WindowsPartitionNumber 3
+    } -MessagePattern 'GPT'
+
+    Assert-Equal 0 $recordedCalls.Count 'no command may run on a non-GPT device'
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
 Test-Case 'a malformed layout never produces a partitioning script' {
     $invalid = [pscustomobject]@{ Valid = $false; Errors = @('synthetic failure'); Partitions = @() }
     Assert-Throws -Body { New-WtgDiskpartScript -Layout $invalid -DiskNumber 1 } -MessagePattern 'invalid layout'
@@ -198,6 +229,32 @@ Test-Case 'a full install with an internal disk attached writes only to the sele
 
     # Verification honestly reports that the fake target has no boot files.
     Assert-False $result.Verification.Valid
+
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
+Test-Case 'a single-USB install reuses the device partition table and still protects internal disks' {
+    Reset-RecordedCalls
+
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-single-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $image = Join-Path $work 'install.wim'
+    Set-Content -LiteralPath $image -Value 'test-image'
+
+    $volumeResolver = { param($diskNumber) [pscustomobject]@{ EspDriveLetter = 'S'; WindowsDriveLetter = 'W' } }
+
+    $null = Invoke-WtgInstall -Disk $external -Authorization $auth -Policy $policy `
+        -ImagePath $image -ImageIndex 1 -WorkDirectory $work -Mode SingleUsb `
+        -WindowsPartitionNumber 3 -VolumeResolver $volumeResolver
+
+    $scriptText = Get-Content -LiteralPath (Join-Path $work 'partition.txt') -Raw
+    Assert-NotContains $scriptText 'clean'
+    Assert-Contains $scriptText 'select partition 3'
+
+    $allText = ($recordedCalls | ForEach-Object { $_.Text }) -join ' || '
+    Assert-NotContains $allText 'disk 0'
+    Assert-Contains $allText 'bcdboot.exe'
 
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
 }
