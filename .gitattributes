@@ -1,0 +1,21 @@
+# Line endings matter here: these scripts are built on Linux/WSL2 and executed by
+# bash there, and by cmd.exe inside WinPE. CRLF in a shell script makes bash fail
+# with "$'\r': command not found", and LF-only is still tolerated by cmd.exe but
+# not by every label/goto construct, so .cmd stays CRLF.
+* text=auto
+
+*.sh            text eol=lf
+*.ps1           text eol=lf
+*.psm1          text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.md            text eol=lf
+*.json          text eol=lf
+*.cmd           text eol=crlf
+*.ini           text eol=crlf
+
+*.img           binary
+*.iso           binary
+*.wim           binary
+*.swm           binary
+*.efi           binary
