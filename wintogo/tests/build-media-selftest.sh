@@ -184,7 +184,8 @@ out3="$temp_root/out3"
 disk_bytes=$((256 * 1024 * 1024))
 
 if run_build "$out3" --work "$temp_root/work3" --single-usb \
-        --disk-size "$disk_bytes" --esp-size-mb 128 --split-size 1; then
+        --disk-size "$disk_bytes" --esp-size-mb 128 --split-size 1 \
+        --min-windows-size 64M; then
     pass 'build-media.sh exited 0 in single-USB mode'
 else
     fail 'build-media.sh failed in single-USB mode'
@@ -263,6 +264,27 @@ if bash "$build_script" --iso "$fake_iso/win.iso-ignored" --out "$temp_root/out6
 else
     pass 'an unattended disk number without a serial is refused'
 fi
+
+# A single-USB device still has to hold Windows itself. 20 GB cannot: after the
+# EFI partition, the MSR and both GPT copies nothing usable is left.
+if bash "$build_script" --iso "$fake_iso/win.iso-ignored" --out "$temp_root/out7" \
+        --single-usb --disk-size 20G > "$temp_root/bad4.log" 2>&1; then
+    fail 'a 20 GB single-USB device was accepted'
+else
+    pass 'a single-USB device with no room for Windows is refused'
+fi
+assert_contains "$temp_root/bad4.log" 'for Windows' 'the refusal explains that Windows would not fit'
+assert_contains "$temp_root/bad4.log" 'at least 25600 MiB' 'the refusal states how much room is required'
+assert_absent "$temp_root/out7/shimuefi-single-usb.img" 'no image is produced for a device that cannot hold Windows'
+
+# The check accounts for the real EFI partition, not just the device size.
+if bash "$build_script" --iso "$fake_iso/win.iso-ignored" --out "$temp_root/out8" \
+        --single-usb --disk-size 30G --esp-size-mb 8192 > "$temp_root/bad5.log" 2>&1; then
+    fail 'a single-USB device whose EFI partition eats the space for Windows was accepted'
+else
+    pass 'an oversized EFI partition that leaves no room for Windows is refused'
+fi
+assert_absent "$temp_root/out8/shimuefi-single-usb.img" 'no image is produced for the oversized-ESP case'
 
 # ---------------------------------------------------------------------------
 printf '\n== summary ==\n'

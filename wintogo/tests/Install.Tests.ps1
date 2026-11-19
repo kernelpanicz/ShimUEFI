@@ -20,6 +20,33 @@ function New-TestAuthorization {
     New-WtgAuthorization -Disk $external -ConfirmedSerial 'S6T7TEST0001234' -Policy $policy -Operator 'test'
 }
 
+# Partition records shaped like Get-Partition output.
+function New-TestPartition {
+    param(
+        [Parameter(Mandatory = $true)][int]$Number,
+        [string]$GptType = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}',
+        [long]$Size = 900GB,
+        [string]$DriveLetter = ''
+    )
+
+    [pscustomobject]@{
+        PartitionNumber = $Number
+        GptType         = $GptType
+        Size            = $Size
+        DriveLetter     = $DriveLetter
+        DiskNumber      = 1
+    }
+}
+
+# The GPT a single-USB medium is built with: ESP + MSR + empty Windows partition.
+function Get-TestSingleUsbPartitions {
+    return @(
+        (New-TestPartition -Number 1 -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -Size 512MB -DriveLetter 'S'),
+        (New-TestPartition -Number 2 -GptType '{e3c9e316-0b5c-4db8-817d-f92df00215ae}' -Size 16MB),
+        (New-TestPartition -Number 3 -Size 960GB)
+    )
+}
+
 $recordedCalls = New-Object 'System.Collections.Generic.List[object]'
 
 function Reset-RecordedCalls {
@@ -88,6 +115,129 @@ Test-Case 'single-USB partitioning refuses a device that is not GPT' {
     } -MessagePattern 'GPT'
 
     Assert-Equal 0 $recordedCalls.Count 'no command may run on a non-GPT device'
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
+Test-Case 'single-USB partitioning refuses to format the EFI system partition' {
+    Reset-RecordedCalls
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-test-' + [guid]::NewGuid().ToString('N'))
+
+    # The ESP holds the installation image this code is running from, so a wrong
+    # partition number must be caught before diskpart is started.
+    Assert-Throws -Body {
+        Invoke-WtgPartition -Disk $external -Authorization $auth -Policy $policy -WorkDirectory $work `
+            -Mode SingleUsb -WindowsPartitionNumber 1 `
+            -PartitionProvider { param($diskNumber) Get-TestSingleUsbPartitions }
+    } -MessagePattern 'EFI system partition'
+
+    Assert-Equal 0 $recordedCalls.Count 'nothing may run before the partition is verified'
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
+Test-Case 'single-USB partitioning refuses the Microsoft reserved partition' {
+    Reset-RecordedCalls
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-test-' + [guid]::NewGuid().ToString('N'))
+
+    Assert-Throws -Body {
+        Invoke-WtgPartition -Disk $external -Authorization $auth -Policy $policy -WorkDirectory $work `
+            -Mode SingleUsb -WindowsPartitionNumber 2 `
+            -PartitionProvider { param($diskNumber) Get-TestSingleUsbPartitions }
+    } -MessagePattern 'Microsoft reserved partition'
+
+    Assert-Equal 0 $recordedCalls.Count
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
+Test-Case 'single-USB partitioning refuses a partition the device does not have' {
+    Reset-RecordedCalls
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-test-' + [guid]::NewGuid().ToString('N'))
+
+    Assert-Throws -Body {
+        Invoke-WtgPartition -Disk $external -Authorization $auth -Policy $policy -WorkDirectory $work `
+            -Mode SingleUsb -WindowsPartitionNumber 4 `
+            -PartitionProvider { param($diskNumber) Get-TestSingleUsbPartitions }
+    } -MessagePattern 'does not exist'
+
+    Assert-Equal 0 $recordedCalls.Count
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
+Test-Case 'single-USB partitioning refuses an unreadable partition table' {
+    Reset-RecordedCalls
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-test-' + [guid]::NewGuid().ToString('N'))
+
+    Assert-Throws -Body {
+        Invoke-WtgPartition -Disk $external -Authorization $auth -Policy $policy -WorkDirectory $work `
+            -Mode SingleUsb -WindowsPartitionNumber 3 `
+            -PartitionProvider { param($diskNumber) throw 'storage stack did not answer' }
+    } -MessagePattern 'could not read the partition table'
+
+    Assert-Equal 0 $recordedCalls.Count
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
+Test-Case 'single-USB partitioning refuses a device without an EFI system partition' {
+    Reset-RecordedCalls
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-test-' + [guid]::NewGuid().ToString('N'))
+
+    $noEsp = @(
+        (New-TestPartition -Number 1 -GptType '{e3c9e316-0b5c-4db8-817d-f92df00215ae}' -Size 16MB),
+        (New-TestPartition -Number 2 -Size 960GB)
+    )
+
+    Assert-Throws -Body {
+        Invoke-WtgPartition -Disk $external -Authorization $auth -Policy $policy -WorkDirectory $work `
+            -Mode SingleUsb -WindowsPartitionNumber 2 `
+            -PartitionProvider { param($diskNumber) $noEsp }
+    } -MessagePattern 'no EFI system partition'
+
+    Assert-Equal 0 $recordedCalls.Count
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
+Test-Case 'single-USB partitioning refuses a Windows partition that is too small' {
+    Reset-RecordedCalls
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-test-' + [guid]::NewGuid().ToString('N'))
+
+    $tiny = @(
+        (New-TestPartition -Number 1 -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -Size 512MB),
+        (New-TestPartition -Number 2 -GptType '{e3c9e316-0b5c-4db8-817d-f92df00215ae}' -Size 16MB),
+        (New-TestPartition -Number 3 -Size 4GB)
+    )
+
+    Assert-Throws -Body {
+        Invoke-WtgPartition -Disk $external -Authorization $auth -Policy $policy -WorkDirectory $work `
+            -Mode SingleUsb -WindowsPartitionNumber 3 `
+            -PartitionProvider { param($diskNumber) $tiny }
+    } -MessagePattern 'below the'
+
+    Assert-Equal 0 $recordedCalls.Count
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
+Test-Case 'single-USB partitioning verifies the Windows partition, then formats only it' {
+    Reset-RecordedCalls
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-test-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $journal = Join-Path $work 'journal.jsonl'
+
+    Invoke-WtgPartition -Disk $external -Authorization $auth -Policy $policy -WorkDirectory $work `
+        -Mode SingleUsb -WindowsPartitionNumber 3 -JournalPath $journal `
+        -PartitionProvider { param($diskNumber) Get-TestSingleUsbPartitions } | Out-Null
+
+    $scriptText = Get-Content -LiteralPath (Join-Path $work 'partition.txt') -Raw
+    Assert-Contains $scriptText 'select partition 3'
+    Assert-NotContains $scriptText 'clean'
+
+    Assert-Contains (Get-Content -LiteralPath $journal -Raw) 'single-usb-partition-verified' 'the verification must be journalled'
+
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
 }
 
@@ -243,10 +393,11 @@ Test-Case 'a single-USB install reuses the device partition table and still prot
     Set-Content -LiteralPath $image -Value 'test-image'
 
     $volumeResolver = { param($diskNumber) [pscustomobject]@{ EspDriveLetter = 'S'; WindowsDriveLetter = 'W' } }
+    $partitionProvider = { param($diskNumber) Get-TestSingleUsbPartitions }
 
     $null = Invoke-WtgInstall -Disk $external -Authorization $auth -Policy $policy `
         -ImagePath $image -ImageIndex 1 -WorkDirectory $work -Mode SingleUsb `
-        -WindowsPartitionNumber 3 -VolumeResolver $volumeResolver
+        -WindowsPartitionNumber 3 -VolumeResolver $volumeResolver -PartitionProvider $partitionProvider
 
     $scriptText = Get-Content -LiteralPath (Join-Path $work 'partition.txt') -Raw
     Assert-NotContains $scriptText 'clean'

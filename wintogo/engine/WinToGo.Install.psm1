@@ -183,6 +183,118 @@ function New-WtgSingleUsbDiskpartScript {
     return ($lines -join [Environment]::NewLine) + [Environment]::NewLine
 }
 
+# GPT partition types that matter when a single-USB medium formats its own
+# Windows partition. Anything that is not Microsoft basic data is refused.
+$script:GptTypeBasicData = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
+$script:GptTypeEsp       = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+$script:GptTypeMsr       = '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
+$script:GptTypeRecovery  = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
+
+function Get-WtgGptTypeLabel {
+    <#
+    .SYNOPSIS
+        Names a GPT partition type so a refusal says what it refused.
+    #>
+    param([string]$GptType)
+
+    switch ($GptType) {
+        $script:GptTypeEsp      { return 'the EFI system partition' }
+        $script:GptTypeMsr      { return 'the Microsoft reserved partition' }
+        $script:GptTypeRecovery { return 'a recovery partition' }
+        $script:GptTypeBasicData { return 'a Windows data partition' }
+        default                 { return ('partition type ' + $GptType) }
+    }
+}
+
+function Assert-WtgSingleUsbWindowsPartition {
+    <#
+    .SYNOPSIS
+        Proves that the partition about to be formatted is the Windows partition.
+
+    .DESCRIPTION
+        In single-USB mode the medium's own GPT is preserved: partition 1 is the
+        ESP that holds the installation image this code is running from, and only
+        the Windows partition is formatted. A partition number is not evidence of
+        what a partition is, so before any write the table is read back and the
+        partition is required to be Microsoft basic data, to exist, to report a
+        plausible size, and to sit on a disk that still carries an ESP.
+
+        Read-only. Throws WTG-INSTALL with a specific message on any mismatch.
+
+    .PARAMETER Partitions
+        Partition records from Get-Partition for the authorized disk.
+
+    .OUTPUTS
+        The verified partition record.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()]$Partitions,
+        [Parameter(Mandatory = $true)][int]$WindowsPartitionNumber,
+        [long]$MinimumBytes = 25GB
+    )
+
+    if ($WindowsPartitionNumber -lt 1) {
+        throw 'WTG-INSTALL: single-USB mode needs a valid Windows partition number'
+    }
+
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($partition in @($Partitions)) {
+        $numberProperty = $partition.PSObject.Properties['PartitionNumber']
+        if ($null -eq $numberProperty -or $null -eq $numberProperty.Value) {
+            throw 'WTG-INSTALL: a partition on the target device reports no partition number; refusing to format anything'
+        }
+
+        $typeProperty = $partition.PSObject.Properties['GptType']
+        $gptType = ''
+        if ($null -ne $typeProperty -and $null -ne $typeProperty.Value) {
+            $gptType = ([string]$typeProperty.Value).Trim().ToLowerInvariant()
+        }
+
+        $sizeProperty = $partition.PSObject.Properties['Size']
+        $size = 0L
+        if ($null -ne $sizeProperty -and $null -ne $sizeProperty.Value) { $size = [long]$sizeProperty.Value }
+
+        $records.Add([pscustomobject]@{
+            Number      = [int]$numberProperty.Value
+            GptType     = $gptType
+            Size        = $size
+            Partition   = $partition
+        })
+    }
+
+    if ($records.Count -eq 0) {
+        throw 'WTG-INSTALL: the target device reports no partitions, so its Windows partition cannot be identified; refusing to format anything'
+    }
+
+    $target = $records | Where-Object { $_.Number -eq $WindowsPartitionNumber } | Select-Object -First 1
+    if ($null -eq $target) {
+        throw ('WTG-INSTALL: partition {0} does not exist on this device; refusing to format anything' -f $WindowsPartitionNumber)
+    }
+
+    if (-not $target.GptType) {
+        throw ('WTG-INSTALL: partition {0} does not report a GPT partition type, so it cannot be shown to be the Windows partition; refusing to format it' -f $WindowsPartitionNumber)
+    }
+    if ($target.GptType -ne $script:GptTypeBasicData) {
+        throw ('WTG-INSTALL: partition {0} is {1}, not a Windows data partition; refusing to format it' -f `
+            $WindowsPartitionNumber, (Get-WtgGptTypeLabel -GptType $target.GptType))
+    }
+
+    $esp = $records | Where-Object { $_.GptType -eq $script:GptTypeEsp } | Select-Object -First 1
+    if ($null -eq $esp) {
+        throw 'WTG-INSTALL: this device carries no EFI system partition, so it is not the single-USB medium it was booted as; refusing to format anything'
+    }
+
+    if ($target.Size -le 0) {
+        throw ('WTG-INSTALL: partition {0} reports no size; refusing to format it' -f $WindowsPartitionNumber)
+    }
+    if ($target.Size -lt $MinimumBytes) {
+        throw ('WTG-INSTALL: partition {0} is only {1:N1} GB, below the {2:N0} GB minimum for Windows; refusing to format it' -f `
+            $WindowsPartitionNumber, ($target.Size / 1GB), ($MinimumBytes / 1GB))
+    }
+
+    return $target.Partition
+}
+
 function Invoke-WtgPartition {
     <#
     .SYNOPSIS
@@ -197,13 +309,42 @@ function Invoke-WtgPartition {
         [Parameter(Mandatory = $true)][string]$WorkDirectory,
         [ValidateSet('Fresh', 'SingleUsb')][string]$Mode = 'Fresh',
         [int]$WindowsPartitionNumber = 3,
+        # Seam for tests: reads the target's partition table before anything is
+        # formatted. Defaults to Get-Partition on the authorized disk.
+        [scriptblock]$PartitionProvider = $null,
         [string]$JournalPath
     )
 
     Assert-WtgDiskWritable -Authorization $Authorization -Disk $Disk -Policy $Policy | Out-Null
 
-    if ($Mode -eq 'SingleUsb' -and $Disk.PartitionStyle -ne 'GPT') {
-        throw ('WTG-INSTALL: single-USB mode needs a GPT device, but disk {0} reports {1}' -f $Disk.Number, $Disk.PartitionStyle)
+    if ($Mode -eq 'SingleUsb') {
+        if ($Disk.PartitionStyle -ne 'GPT') {
+            throw ('WTG-INSTALL: single-USB mode needs a GPT device, but disk {0} reports {1}' -f $Disk.Number, $Disk.PartitionStyle)
+        }
+
+        # The partition that is about to be formatted is verified against the live
+        # table first: formatting the ESP here would destroy the installation image
+        # that is running this code.
+        $provider = $PartitionProvider
+        if ($null -eq $provider) {
+            $provider = { param($diskNumber) @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop) }
+        }
+
+        $partitions = $null
+        try {
+            $partitions = @(& $provider $Authorization.DiskNumber)
+        }
+        catch {
+            throw ('WTG-INSTALL: could not read the partition table of disk {0} before formatting it: {1}' -f $Authorization.DiskNumber, $_.Exception.Message)
+        }
+
+        $verified = Assert-WtgSingleUsbWindowsPartition -Partitions $partitions -WindowsPartitionNumber $WindowsPartitionNumber
+
+        if ($JournalPath) {
+            Add-WtgJournal -Path $JournalPath -Event 'single-usb-partition-verified' `
+                -Message ('partition {0} on disk {1} is a Windows data partition' -f $WindowsPartitionNumber, $Authorization.DiskNumber) `
+                -Data @{ disk = $Authorization.DiskNumber; partition = $WindowsPartitionNumber; sizeBytes = [long]$verified.Size }
+        }
     }
 
     if (-not (Test-Path -LiteralPath $WorkDirectory)) {
@@ -621,6 +762,8 @@ function Invoke-WtgInstall {
         [string]$OperatingSystemLocale = 'en-us',
         [ValidateSet('Fresh', 'SingleUsb')][string]$Mode = 'Fresh',
         [int]$WindowsPartitionNumber = 3,
+        # Seam for tests: see Invoke-WtgPartition.
+        [scriptblock]$PartitionProvider = $null,
         [scriptblock]$OnProgress,
         # Seam for tests: resolves the ESP and Windows drive letters after
         # partitioning. Defaults to the real volume discovery.
@@ -682,9 +825,18 @@ function Invoke-WtgInstall {
     else {
         & $report 'partition' 12 'Wiping and partitioning the selected device'
     }
-    Invoke-WtgPartition -Disk $Disk -Authorization $Authorization -Policy $Policy `
-        -Layout $layout -WorkDirectory $WorkDirectory -Mode $Mode `
-        -WindowsPartitionNumber $WindowsPartitionNumber -JournalPath $JournalPath | Out-Null
+    $partitionParameters = @{
+        Disk                   = $Disk
+        Authorization          = $Authorization
+        Policy                 = $Policy
+        Layout                 = $layout
+        WorkDirectory          = $WorkDirectory
+        Mode                   = $Mode
+        WindowsPartitionNumber = $WindowsPartitionNumber
+        JournalPath            = $JournalPath
+    }
+    if ($null -ne $PartitionProvider) { $partitionParameters['PartitionProvider'] = $PartitionProvider }
+    Invoke-WtgPartition @partitionParameters | Out-Null
 
     & $report 'partition' 20 'Waiting for the new volumes'
     if ($null -eq $VolumeResolver) {
@@ -768,6 +920,8 @@ Export-ModuleMember -Function @(
     'Invoke-WtgExternal',
     'New-WtgDiskpartScript',
     'New-WtgSingleUsbDiskpartScript',
+    'Get-WtgGptTypeLabel',
+    'Assert-WtgSingleUsbWindowsPartition',
     'Invoke-WtgPartition',
     'Get-WtgTargetVolumes',
     'ConvertFrom-WtgWimInfo',

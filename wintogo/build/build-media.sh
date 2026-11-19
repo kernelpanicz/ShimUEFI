@@ -39,6 +39,7 @@ allow_sd_card=0
 allow_internal_override=0
 single_usb=0
 disk_size=""
+min_windows_size="25G"
 keep_work=0
 
 info()  { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -73,6 +74,9 @@ Single device:
                            Windows target, so a single USB drive is enough
   --disk-size SIZE         Size of that device, in bytes or with a K/M/G suffix.
                            Must match the device exactly; the installer checks it
+  --min-windows-size SIZE  How much space the Windows partition must be left
+                           with after the EFI partition and MSR (default: 25G).
+                           A --disk-size that leaves less is refused
 
 Unattended (still requires the serial number):
   --unattended-disk N      Default target disk number
@@ -104,6 +108,7 @@ while [ $# -gt 0 ]; do
         --allow-internal-bus-override) allow_internal_override=1; shift ;;
         --single-usb)       single_usb=1; shift ;;
         --disk-size)        disk_size="$2"; shift 2 ;;
+        --min-windows-size) min_windows_size="$2"; shift 2 ;;
         --unattended-disk)  unattended_disk="$2"; shift 2 ;;
         --unattended-serial) unattended_serial="$2"; shift 2 ;;
         --unattended-index) unattended_index="$2"; shift 2 ;;
@@ -139,6 +144,66 @@ if [ -n "$disk_size" ] || [ "$single_usb" -eq 1 ]; then
 fi
 if [ "$single_usb" -eq 1 ] && [ -z "$disk_size" ]; then
     die "--single-usb needs --disk-size (the exact capacity of the device, e.g. --disk-size 64023257088)"
+fi
+
+to_bytes() {
+    local value="$1"
+    case "$value" in
+        *[kK]) printf '%s' $(( ${value%?} * 1024 )) ;;
+        *[mM]) printf '%s' $(( ${value%?} * 1024 * 1024 )) ;;
+        *[gG]) printf '%s' $(( ${value%?} * 1024 * 1024 * 1024 )) ;;
+        *[tT]) printf '%s' $(( ${value%?} * 1024 * 1024 * 1024 * 1024 )) ;;
+        *)      printf '%s' "$value" ;;
+    esac
+}
+
+# A single-USB medium still has to leave usable room for Windows. These numbers
+# mirror New-WtgLayoutPlan in wintogo/engine/WinToGo.Layout.psm1 (1 MiB front
+# reserve, 1 MiB backup GPT, 16 MiB MSR), so the build cannot produce a device
+# the installer would then have to refuse.
+layout_front_bytes=$((1024 * 1024))
+layout_back_bytes=$((1024 * 1024))
+msr_bytes=$((16 * 1024 * 1024))
+
+# check_single_usb_capacity <esp-size-in-MiB>
+# Dies unless the Windows partition is at least $min_windows_bytes.
+check_single_usb_capacity() {
+    local esp_mb="$1"
+    local windows_bytes=$(( disk_bytes - layout_front_bytes - layout_back_bytes - esp_mb * 1024 * 1024 - msr_bytes ))
+    if [ "$windows_bytes" -lt "$min_windows_bytes" ]; then
+        if [ "$windows_bytes" -lt 0 ]; then windows_bytes=0; fi
+        # Plain string expansion, not printf: a format string starting with a
+        # dash is read as an option by printf and the message would be lost.
+        die "--disk-size $disk_size ($disk_bytes bytes) leaves only $(( windows_bytes / 1024 / 1024 )) MiB for Windows after a ${esp_mb} MiB EFI partition, the MSR and both partition tables; at least $(( min_windows_bytes / 1024 / 1024 )) MiB is required. Use a larger device, or lower --min-windows-size if you know your image fits."
+    fi
+}
+
+if [ "$single_usb" -eq 1 ]; then
+    min_windows_bytes="$(to_bytes "$min_windows_size")"
+    case "$min_windows_bytes" in
+        ''|*[!0-9]*) die "--min-windows-size must be a number of bytes, or a number with a K/M/G suffix" ;;
+    esac
+    if [ "$min_windows_bytes" -le 0 ]; then
+        die "--min-windows-size must be greater than zero"
+    fi
+
+    disk_bytes="$(to_bytes "$disk_size")"
+    case "$disk_bytes" in
+        ''|*[!0-9]*) die "--disk-size must be a number of bytes, or a number with a K/M/G suffix" ;;
+    esac
+    if [ "$disk_bytes" -le 0 ]; then
+        die "--disk-size must be greater than zero"
+    fi
+
+    # With no explicit --esp-size-mb the EFI partition is computed from the size
+    # of the staged files, and is never smaller than 768 MiB. Checking against
+    # that floor here fails fast, and the check is repeated against the real size
+    # once the medium has been staged.
+    probe_esp_mb="$esp_size_mb"
+    if [ "$probe_esp_mb" -eq 0 ]; then
+        probe_esp_mb=768
+    fi
+    check_single_usb_capacity "$probe_esp_mb"
 fi
 
 need_tools="xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir truncate dd sha256sum du awk"
@@ -233,22 +298,7 @@ fi
 
 # A single-USB medium describes the device it was built for, so the installer can
 # refuse to run on anything else.
-to_bytes() {
-    local value="$1"
-    case "$value" in
-        *[kK]) printf '%s' $(( ${value%?} * 1024 )) ;;
-        *[mM]) printf '%s' $(( ${value%?} * 1024 * 1024 )) ;;
-        *[gG]) printf '%s' $(( ${value%?} * 1024 * 1024 * 1024 )) ;;
-        *[tT]) printf '%s' $(( ${value%?} * 1024 * 1024 * 1024 * 1024 )) ;;
-        *)      printf '%s' "$value" ;;
-    esac
-}
-
 if [ "$single_usb" -eq 1 ]; then
-    disk_bytes="$(to_bytes "$disk_size")"
-    case "$disk_bytes" in
-        ''|*[!0-9]*) die "--disk-size must be a number of bytes, or a number with a K/M/G suffix" ;;
-    esac
     cat > "$work_dir/payload/wintogo/single-usb.json" <<EOF
 {
   "schema": 1,
@@ -400,9 +450,8 @@ fi
 if [ "$single_usb" -eq 1 ]; then
     step "building the single-USB disk image"
 
-    if [ "$disk_bytes" -le $(( (esp_size_mb + 32) * 1024 * 1024 )) ]; then
-        die "--disk-size is too small for a ${esp_size_mb} MiB EFI partition plus MSR"
-    fi
+    # The EFI partition size is only known now that the medium has been staged.
+    check_single_usb_capacity "$esp_size_mb"
 
     # p1 ESP at 1 MiB (sector 2048), p2 MSR, p3 the rest as an empty Windows
     # partition. The ESP file is written straight onto p1: no loop device, no root.
