@@ -148,6 +148,23 @@ refused with the size to rebuild for, rather than "repaired" by guessing: a GPT
 that claims space the device does not have is the failure mode that produces an
 unbootable stick.
 
+Two checks are added on top of that:
+
+- **The build refuses a device that cannot hold Windows.** `build-media.sh`
+  subtracts the 1 MiB front reserve, the 1 MiB backup GPT, the EFI partition and
+  the 16 MiB MSR, and refuses a `--disk-size` that leaves less than
+  `--min-windows-size` (25 GiB, the installer's own minimum). It checks twice: at
+  argument validation against the smallest possible ESP, and again once the real
+  ESP size is known. Producing a stick the installer would then reject is the
+  outcome this prevents.
+- **The partition is verified before it is formatted.** In single-USB mode a
+  partition number carries no meaning on its own, and partition 1 here is the ESP
+  that holds the image this code was loaded from. `Invoke-WtgPartition` therefore
+  reads the live table first and `Assert-WtgSingleUsbWindowsPartition` requires
+  the target to be Microsoft basic data (not ESP, MSR or recovery), to report a
+  size at or above the Windows minimum, and to be on a disk that still carries an
+  ESP. Nothing is written unless all of that holds.
+
 This costs no RAM. The obvious alternative — staging a 5 GB image in the WinPE
 ramdisk — does not fit in a default WinPE X: volume, so it was rejected.
 
@@ -194,8 +211,8 @@ gives first-boot specialization.
 
 | Layer | How it is tested | Status |
 |---|---|---|
-| `build-media.sh` | Self-test runs the real script end to end with a simulated xorriso/wimlib/mtools/sgdisk on PATH and asserts on the produced FAT contents, patched WIM, split parts, manifest, ISO and single-USB layout | Passing (42 checks) |
-| Classification, authorization, protection plan | 60 unit tests with synthetic disk records, including eMMC/UFS/NVMe/SATA/SD/system-disk cases | Passing |
+| `build-media.sh` | Self-test runs the real script end to end with a simulated xorriso/wimlib/mtools/sgdisk on PATH and asserts on the produced FAT contents, patched WIM, split parts, manifest, ISO, single-USB layout and the too-small-device refusal | Passing (48 checks) |
+| Classification, authorization, protection plan | 67 unit tests with synthetic disk records, including eMMC/UFS/NVMe/SATA/SD/system-disk cases | Passing |
 | Pipeline command generation | Unit test records every executor call during a full install with an internal disk attached and fails if any command names it | Passing |
 | Real storage stack | QEMU/OVMF: internal disk as a qcow2 base + overlay; assert zero data clusters written and base hash unchanged | Not run here (needs ISO) |
 | Real installation | End-to-end on hardware | Not run here |

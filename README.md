@@ -234,6 +234,7 @@ Useful options:
 --allow-sd-card           # let the installer offer SD cards as targets
 --allow-internal-bus-override   # let it offer NVMe/SATA enclosures (serial still required)
 --single-usb --disk-size SIZE   # one image that is both installer and target
+--min-windows-size SIZE   # room Windows must be left with in single-USB mode (25G)
 --unattended-disk N --unattended-serial S --unattended-index I
 --work DIR --keep-work
 ```
@@ -293,13 +294,24 @@ retried on the same stick. Everything else, including the storage protection, is
 identical: the device is still an external disk that must be selected and have
 its serial number confirmed.
 
-Two constraints, both deliberate:
+Before it formats anything, it reads the device's partition table back and
+requires the partition it is about to format to be Microsoft basic data, to
+carry a plausible size, and to sit on a disk that still has an ESP. A partition
+*number* is not evidence of what a partition *is*, and formatting the ESP here
+would destroy the image the installer is running from.
+
+Three constraints, all deliberate:
 
 - **The declared size must match the device.** The image's partition table
   describes exactly `--disk-size` bytes; booting it on a smaller or larger disk
   would leave the table wrong, so the installer compares the real capacity and
   refuses with the correct size to rebuild for. Use bytes (or a `K`/`M`/`G`
   suffix); `lsblk -b` prints bytes.
+- **The device must have room for Windows.** After the EFI partition, the MSR
+  and both partition tables, at least 25 GiB (the same minimum the installer
+  enforces) has to be left; a smaller `--disk-size` is refused at build time
+  instead of producing a stick that cannot hold Windows. `--min-windows-size`
+  overrides that minimum.
 - **The installer payload stays on the EFI partition afterwards**, taking a few
   GB. Deleting it would remove the ability to retry the installation.
 
@@ -426,7 +438,7 @@ demonstrate.
 powershell -NoProfile -ExecutionPolicy Bypass -File wintogo/tests/run-tests.ps1
 ```
 
-60 tests across four suites, covering device classification (including eMMC, UFS,
+67 tests across four suites, covering device classification (including eMMC, UFS,
 NVMe, SATA, SD, unknown bus types and system disks), authorization and the
 pre-write re-validation, the protection plan, the command filter, the GPT layout
 arithmetic, the single-USB layout check, the diskpart script generators, the DISM
@@ -453,10 +465,13 @@ the real script end to end. It then checks what the script actually produced:
 - in single-USB mode the image is exactly the declared size, the FAT filesystem
   lands at the 1 MiB partition offset, the GPT area is untouched, and the
   partition types are EFI/MSR/Windows;
+- a single-USB device with no room left for Windows is refused, both by total
+  size and when an oversized EFI partition is what consumed the space, and no
+  image is written for it;
 - malformed inputs (no install image, `--single-usb` without `--disk-size`, an
   unattended disk number without its serial) are refused.
 
-42 checks, and it runs on every push in CI.
+48 checks, and it runs on every push in CI.
 
 ### Virtual machine test (needs a built ISO and KVM/TCG)
 
@@ -489,8 +504,8 @@ matters more here than anywhere else.
 
 - **`build-media.sh` really runs**: the self-test executes it end to end against a
   simulated toolchain and asserts on the resulting FAT contents, patched WIM,
-  split parts, manifest, ISO and single-USB partition layout (42 checks).
-- The 60 unit tests pass under Windows PowerShell 5.1 (the PowerShell version
+  split parts, manifest, ISO and single-USB partition layout (48 checks).
+- The 67 unit tests pass under Windows PowerShell 5.1 (the PowerShell version
   present in WinPE) on a real Windows host.
 - The storage classifier was run against real hardware: on the development
   machine it correctly classifies the internal NVMe system disk as
