@@ -372,6 +372,9 @@ function Add-WtgJournal {
         $Data = $null
     )
 
+    # An empty path would silently create journal.jsonl in the current directory.
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+
     try {
         $directory = Split-Path -Parent $Path
         if ($directory -and -not (Test-Path -LiteralPath $directory)) {
