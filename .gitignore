@@ -1,0 +1,11 @@
+/bootloader/bin/cryptsetup
+/data
+/*.bin
+
+# ShimUEFI portable Windows build output
+/build
+/out
+*.img
+*.iso
+/wintogo/tests/qemu/work
+.freebuff/

@@ -1,0 +1,97 @@
+name: shimuefi
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      windows_iso_url:
+        description: 'Direct URL to a Windows ISO you are licensed to use (optional; enables the media build job)'
+        required: false
+        type: string
+
+jobs:
+  powershell-tests:
+    name: engine tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: run the engine test suites
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File wintogo/tests/run-tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: check the installer script parses
+        shell: powershell
+        run: |
+          $errors = $null
+          $tokens = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'wintogo/runtime/wintogo.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          Write-Host 'wintogo.ps1 parses cleanly'
+
+  shell-lint:
+    name: shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: syntax check
+        run: |
+          for script in wintogo/build/build-media.sh wintogo/tests/qemu/run-protection-test.sh; do
+            echo "bash -n $script"
+            bash -n "$script"
+          done
+
+      - name: shellcheck
+        run: |
+          shellcheck --severity=error \
+            wintogo/build/build-media.sh \
+            wintogo/tests/qemu/run-protection-test.sh
+
+      - name: verify the winpe payload files exist
+        run: |
+          test -f wintogo/runtime/winpeshl.ini
+          test -f wintogo/runtime/startnet.cmd
+          test -f wintogo/runtime/wintogo.ps1
+          ls wintogo/engine/*.psm1
+
+  build-media:
+    name: build installation media
+    runs-on: ubuntu-latest
+    # Only runs when someone supplies a Windows ISO URL by hand. Microsoft media
+    # is never downloaded automatically and is never committed to this repository.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_iso_url != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso wimtools mtools dosfstools gdisk
+
+      - name: download the supplied ISO
+        run: curl -fL --retry 3 -o windows.iso "${{ inputs.windows_iso_url }}"
+
+      - name: build the medium
+        run: |
+          sudo ./wintogo/build/build-media.sh --iso windows.iso --iso-image --keep-work
+
+      - name: upload the medium
+        uses: actions/upload-artifact@v4
+        with:
+          name: shimuefi-installer
+          path: |
+            out/shimuefi-installer.img
+            out/shimuefi-installer.iso
+            out/manifest.txt
+          retention-days: 7
