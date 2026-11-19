@@ -40,6 +40,7 @@ allow_internal_override=0
 single_usb=0
 disk_size=""
 min_windows_size="25G"
+min_device_size="32G"
 keep_work=0
 
 info()  { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -74,6 +75,8 @@ Single device:
                            Windows target, so a single USB drive is enough
   --disk-size SIZE         Size of that device, in bytes or with a K/M/G suffix.
                            Must match the device exactly; the installer checks it
+  --min-device-size SIZE   Smallest device a medium may be built for, matching
+                           the installer's own target policy (default: 32G)
   --min-windows-size SIZE  How much space the Windows partition must be left
                            with after the EFI partition and MSR (default: 25G).
                            A --disk-size that leaves less is refused
@@ -109,6 +112,7 @@ while [ $# -gt 0 ]; do
         --single-usb)       single_usb=1; shift ;;
         --disk-size)        disk_size="$2"; shift 2 ;;
         --min-windows-size) min_windows_size="$2"; shift 2 ;;
+        --min-device-size)  min_device_size="$2"; shift 2 ;;
         --unattended-disk)  unattended_disk="$2"; shift 2 ;;
         --unattended-serial) unattended_serial="$2"; shift 2 ;;
         --unattended-index) unattended_index="$2"; shift 2 ;;
@@ -193,6 +197,26 @@ if [ "$single_usb" -eq 1 ]; then
     esac
     if [ "$disk_bytes" -le 0 ]; then
         die "--disk-size must be greater than zero"
+    fi
+
+    # The installer's own policy (New-WtgStoragePolicy -MinimumTargetBytes) refuses
+    # a disk under 32 GiB, so a medium built for a smaller device would only be
+    # rejected after the operator had already flashed and booted it.
+    min_device_bytes="$(to_bytes "$min_device_size")"
+    case "$min_device_bytes" in
+        ''|*[!0-9]*) die "--min-device-size must be a number of bytes, or a number with a K/M/G suffix" ;;
+    esac
+    if [ "$min_device_bytes" -le 0 ]; then
+        die "--min-device-size must be greater than zero"
+    fi
+
+    if [ "$disk_bytes" -lt "$min_device_bytes" ]; then
+        if [ "$min_device_bytes" -ge $((1024 * 1024 * 1024)) ]; then
+            min_device_label="$(( min_device_bytes / 1024 / 1024 / 1024 )) GiB"
+        else
+            min_device_label="$(( min_device_bytes / 1024 / 1024 )) MiB"
+        fi
+        die "--disk-size $disk_size ($disk_bytes bytes) is below the installer's minimum target of $min_device_label; a medium built for this device would be refused at install time. Use a larger device, or lower --min-device-size only if you also lowered the installer policy."
     fi
 
     # With no explicit --esp-size-mb the EFI partition is computed from the size

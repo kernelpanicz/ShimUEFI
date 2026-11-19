@@ -150,13 +150,15 @@ unbootable stick.
 
 Two checks are added on top of that:
 
-- **The build refuses a device that cannot hold Windows.** `build-media.sh`
-  subtracts the 1 MiB front reserve, the 1 MiB backup GPT, the EFI partition and
-  the 16 MiB MSR, and refuses a `--disk-size` that leaves less than
-  `--min-windows-size` (25 GiB, the installer's own minimum). It checks twice: at
-  argument validation against the smallest possible ESP, and again once the real
-  ESP size is known. Producing a stick the installer would then reject is the
-  outcome this prevents.
+- **The build refuses a device the installer would reject.** Two floors apply,
+  both mirroring the runtime: `--min-device-size` (32 GiB,
+  `New-WtgStoragePolicy -MinimumTargetBytes`, below which no disk is even
+  eligible) and `--min-windows-size` (25 GiB left after subtracting the 1 MiB
+  front reserve, the 1 MiB backup GPT, the real EFI partition and the 16 MiB
+  MSR). The Windows-room check runs twice: at argument validation against the
+  smallest possible ESP, and again once the real ESP size is known. Producing a
+  stick that is refused only after it has been flashed and booted is the outcome
+  this prevents.
 - **The partition is verified before it is formatted.** In single-USB mode a
   partition number carries no meaning on its own, and partition 1 here is the ESP
   that holds the image this code was loaded from. `Invoke-WtgPartition` therefore
