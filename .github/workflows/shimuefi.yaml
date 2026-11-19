@@ -36,6 +36,17 @@ jobs:
           }
           Write-Host 'wintogo.ps1 parses cleanly'
 
+  build-selftest:
+    name: build-media self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Runs the real build script end to end. The media tools are simulated, so
+      # no Windows ISO and no packages beyond coreutils are needed.
+      - name: run build-media.sh against a simulated toolchain
+        run: bash wintogo/tests/build-media-selftest.sh
+
   shell-lint:
     name: shell scripts
     runs-on: ubuntu-latest
@@ -47,7 +58,10 @@ jobs:
 
       - name: syntax check
         run: |
-          for script in wintogo/build/build-media.sh wintogo/tests/qemu/run-protection-test.sh; do
+          for script in wintogo/build/build-media.sh \
+                        wintogo/tests/qemu/run-protection-test.sh \
+                        wintogo/tests/build-media-selftest.sh \
+                        wintogo/tests/lib/media-stubs.sh; do
             echo "bash -n $script"
             bash -n "$script"
           done
@@ -56,7 +70,9 @@ jobs:
         run: |
           shellcheck --severity=error \
             wintogo/build/build-media.sh \
-            wintogo/tests/qemu/run-protection-test.sh
+            wintogo/tests/qemu/run-protection-test.sh \
+            wintogo/tests/build-media-selftest.sh \
+            wintogo/tests/lib/media-stubs.sh
 
       - name: verify the winpe payload files exist
         run: |
