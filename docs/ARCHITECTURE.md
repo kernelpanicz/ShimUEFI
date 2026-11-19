@@ -128,10 +128,28 @@ GPT, three partitions, UEFI only:
   would create media that appears to work and then does not.
 - **`EFI/BOOT/BOOTX64.EFI` alongside `EFI/Microsoft/Boot/bootmgfw.efi`**: firmware
   fallback paths vary wildly between vendors; the fallback copy is what makes the
-  disk boot on an unfamiliar machine.
+  disk boot on an unfamiliar machine. `Confirm-WtgFallbackLoader` places it when
+  `bcdboot` does not.
+- **No recovery partition.** It would be unconfigured, because nothing here wires
+  `reagentc`, so an option to create one would produce a partition that looks
+  functional and is not. The layout has no such option.
 
-`-WithRecovery` adds a 1 GiB partition at the end but is not wired into
-`reagentc`; see limitations.
+### Single-USB layout
+
+A medium built with `--single-usb` is both installer and target. Its GPT is laid
+out at build time as EFI (holding WinPE and the Windows image) + MSR + an empty
+Windows partition covering the rest, so the install never repartitions: it formats
+one partition. Wiping the table would destroy the very ESP the installation image
+is being read from.
+
+The image therefore describes a fixed byte size, and the runtime compares the
+real device capacity against the size recorded in `single-usb.json`. A mismatch is
+refused with the size to rebuild for, rather than "repaired" by guessing: a GPT
+that claims space the device does not have is the failure mode that produces an
+unbootable stick.
+
+This costs no RAM. The obvious alternative — staging a 5 GB image in the WinPE
+ramdisk — does not fit in a default WinPE X: volume, so it was rejected.
 
 ## 5. Portability decisions
 
@@ -176,7 +194,8 @@ gives first-boot specialization.
 
 | Layer | How it is tested | Status |
 |---|---|---|
-| Classification, authorization, protection plan | 52 unit tests with synthetic disk records, including eMMC/UFS/NVMe/SATA/SD/system-disk cases | Passing |
+| `build-media.sh` | Self-test runs the real script end to end with a simulated xorriso/wimlib/mtools/sgdisk on PATH and asserts on the produced FAT contents, patched WIM, split parts, manifest, ISO and single-USB layout | Passing (42 checks) |
+| Classification, authorization, protection plan | 60 unit tests with synthetic disk records, including eMMC/UFS/NVMe/SATA/SD/system-disk cases | Passing |
 | Pipeline command generation | Unit test records every executor call during a full install with an internal disk attached and fails if any command names it | Passing |
 | Real storage stack | QEMU/OVMF: internal disk as a qcow2 base + overlay; assert zero data clusters written and base hash unchanged | Not run here (needs ISO) |
 | Real installation | End-to-end on hardware | Not run here |
@@ -186,7 +205,10 @@ installer's own reporting cannot mask a write.
 
 ## 8. Known gaps
 
-- No WinRE configuration.
+- No WinRE configuration, and no recovery partition: an unconfigured one would
+  only be decoration.
+- The build self-test proves the script's logic, not that the real tools accept
+  these exact command lines; one run on Linux with the real packages is still owed.
 - The protection plan cannot offline a disk the firmware has marked as the boot
   disk; those are always classified internal anyway, and `Set-Disk` may fail on
   them. In that case the read-only flag still applies and the run aborts only if

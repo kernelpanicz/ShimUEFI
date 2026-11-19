@@ -25,6 +25,7 @@ Windows kernel, `winload.efi` and `bootmgfw.efi` from Microsoft.
 - [Requirements](#requirements)
 - [Build the installation medium](#build-the-installation-medium)
 - [Write the medium to a USB drive](#write-the-medium-to-a-usb-drive)
+- [One USB drive is enough](#one-usb-drive-is-enough)
 - [Install Windows onto an external disk](#install-windows-onto-an-external-disk)
 - [Portability across computers](#portability-across-computers)
 - [Supported and unsupported hardware](#supported-and-unsupported-hardware)
@@ -46,6 +47,10 @@ disk:
 |---|---|
 | **Installer medium** | A small (≥2 GB) USB stick booted in UEFI mode. Runs WinPE plus the ShimUEFI installer. |
 | **Target disk** | A second external disk (≥32 GB) that Windows is installed onto and then boots from. |
+
+If you only have one USB drive, build the **single-USB** medium instead: the same
+device is both the installer and the Windows disk. See
+[One USB drive is enough](#one-usb-drive-is-enough).
 
 The installer:
 
@@ -228,6 +233,7 @@ Useful options:
 --driver-dir DIR          # add storage drivers (e.g. Intel RST/VMD) to the medium
 --allow-sd-card           # let the installer offer SD cards as targets
 --allow-internal-bus-override   # let it offer NVMe/SATA enclosures (serial still required)
+--single-usb --disk-size SIZE   # one image that is both installer and target
 --unattended-disk N --unattended-serial S --unattended-index I
 --work DIR --keep-work
 ```
@@ -257,7 +263,48 @@ Windows: use any raw image writer (Rufus in *DD image* mode, balenaEtcher, or
 `Win32DiskImager`) and select the `.img`.
 
 **Write the installer image to the installer stick, not to the disk you want to
-install Windows onto.** The two must be different devices.
+install Windows onto.** The two must be different devices — unless you built the
+single-USB medium, in which case that one device is both.
+
+## One USB drive is enough
+
+With `--single-usb` the medium is also the installation target, so a single USB
+drive is all you need:
+
+```bash
+# find the exact capacity of the drive, then build for exactly that size
+lsblk -b -d -o NAME,SIZE /dev/sdX
+
+sudo ./wintogo/build/build-media.sh --iso /path/to/windows.iso \
+    --single-usb --disk-size 64023257088
+
+sudo dd if=out/shimuefi-single-usb.img of=/dev/sdX bs=4M \
+        oflag=direct status=progress conv=fsync
+```
+
+The image is a GPT disk with three partitions: a FAT32 EFI partition holding
+WinPE and the Windows image, a Microsoft reserved partition, and an empty
+Windows partition covering the rest of the device.
+
+When it boots, the installer recognises the layout description on the medium. It
+formats only the Windows partition — the partition table and the EFI partition
+holding the installation image are preserved, so a failed run can simply be
+retried on the same stick. Everything else, including the storage protection, is
+identical: the device is still an external disk that must be selected and have
+its serial number confirmed.
+
+Two constraints, both deliberate:
+
+- **The declared size must match the device.** The image's partition table
+  describes exactly `--disk-size` bytes; booting it on a smaller or larger disk
+  would leave the table wrong, so the installer compares the real capacity and
+  refuses with the correct size to rebuild for. Use bytes (or a `K`/`M`/`G`
+  suffix); `lsblk -b` prints bytes.
+- **The installer payload stays on the EFI partition afterwards**, taking a few
+  GB. Deleting it would remove the ability to retry the installation.
+
+The two-device flow is still the better one when you have a spare stick: the
+installer medium is then independent of the Windows disk.
 
 ## Install Windows onto an external disk
 
@@ -379,12 +426,37 @@ demonstrate.
 powershell -NoProfile -ExecutionPolicy Bypass -File wintogo/tests/run-tests.ps1
 ```
 
-52 tests across four suites, covering device classification (including eMMC, UFS,
+60 tests across four suites, covering device classification (including eMMC, UFS,
 NVMe, SATA, SD, unknown bus types and system disks), authorization and the
 pre-write re-validation, the protection plan, the command filter, the GPT layout
-arithmetic, the diskpart script generator, the DISM output parser, the offline
-registry operations, and a full pipeline run with a recorded command executor
-that fails if any command names an internal disk.
+arithmetic, the single-USB layout check, the diskpart script generators, the DISM
+output parser, the offline registry operations, and full pipeline runs with a
+recorded command executor that fails if any command names an internal disk.
+
+### Build script self-test
+
+```bash
+bash wintogo/tests/build-media-selftest.sh
+```
+
+`bash -n` only proves `build-media.sh` parses. This harness puts a **simulated
+media toolchain** on `PATH` (`xorriso`, `wimlib-imagex`, `mkfs.vfat`, `mmd`,
+`mcopy`, `mdir`, `sgdisk`), points it at a synthetic Windows ISO tree, and runs
+the real script end to end. It then checks what the script actually produced:
+
+- the FAT image contains `EFI/Boot/BOOTX64.EFI`, `BCD`, `bootmgfw.efi`, fonts,
+  `boot.wim` and the split `install.swm`, and the unsplit image is gone;
+- `boot.wim` was patched with `/wintogo/wintogo.ps1`, the engine,
+  `winpeshl.ini` and `startnet.cmd`, and the staging copy did not leak in;
+- the answer file carries the disk number, serial and driver path;
+- the manifest has sha256 checksums; the ISO is produced only with `--iso-image`;
+- in single-USB mode the image is exactly the declared size, the FAT filesystem
+  lands at the 1 MiB partition offset, the GPT area is untouched, and the
+  partition types are EFI/MSR/Windows;
+- malformed inputs (no install image, `--single-usb` without `--disk-size`, an
+  unattended disk number without its serial) are refused.
+
+42 checks, and it runs on every push in CI.
 
 ### Virtual machine test (needs a built ISO and KVM/TCG)
 
@@ -415,18 +487,21 @@ matters more here than anywhere else.
 
 **Verified in this repository**
 
-- The 52 unit tests pass under Windows PowerShell 5.1 (the PowerShell version
+- **`build-media.sh` really runs**: the self-test executes it end to end against a
+  simulated toolchain and asserts on the resulting FAT contents, patched WIM,
+  split parts, manifest, ISO and single-USB partition layout (42 checks).
+- The 60 unit tests pass under Windows PowerShell 5.1 (the PowerShell version
   present in WinPE) on a real Windows host.
 - The storage classifier was run against real hardware: on the development
   machine it correctly classifies the internal NVMe system disk as
   `Internal/High` and refuses to build a target list from it.
-- Shell scripts pass `bash -n` syntax checking.
 
 **Not verified here, and therefore not claimed to work**
 
-- Patching `boot.wim` and booting the result: the build script requires
-  `xorriso`, `wimlib-imagex`, `mtools` and `mkfs.vfat`, which were not available
-  in the environment this was written in.
+- The **real** toolchain. The self-test substitutes `xorriso`, `wimlib-imagex`,
+  `mkfs.vfat`, mtools and `sgdisk`, so it proves the script's own logic, not that
+  those tools accept these exact command lines. Running it once on Linux with the
+  real packages installed is still the last step.
 - An actual Windows installation end to end (`diskpart`, `dism`, `bcdboot`,
   offline registry edits) on real or virtual hardware; it needs a Windows ISO and
   QEMU/OVMF.
@@ -439,9 +514,9 @@ Microsoft procedure; the tests cover the logic that decides *which disk*.
 
 ## Known limitations
 
-- **No WinRE.** Windows Recovery Environment is not configured on the target.
-  `Test-WtgInstallation` does not require it. A recovery partition layout exists
-  (`-WithRecovery`) but is not wired into `reagentc`.
+- **No WinRE.** There is no recovery partition. Nothing in this project wires one
+  into `reagentc`, and an unconfigured recovery partition would be decoration that
+  looks like a feature, so the layout has no option to create one.
 - **Hibernation and fast startup are disabled** — both need a fixed non-removable
   volume.
 - **Windows Update may install firmware drivers** that assume the machine it first
@@ -477,6 +552,8 @@ wintogo/
   tests/
     run-tests.ps1           test runner
     *.Tests.ps1             unit suites
+    build-media-selftest.sh runs build-media.sh against a simulated toolchain
+    lib/media-stubs.sh      the simulated xorriso/wimlib/mtools/sgdisk
     qemu/                   zero-write verification with OVMF
 docs/
   ARCHITECTURE.md           design decisions, threat model, trade-offs
