@@ -1,1 +1,124 @@
 
+name: ShimUEFI BIOS Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_iso_url:
+        description: "Direct download URL for your Windows ISO"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows BIOS Installer
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            gettext \
+            p7zip-full \
+            xorriso \
+            wimtools \
+            mtools \
+            dosfstools \
+            gdisk \
+            coreutils \
+            util-linux \
+            curl \
+            file
+
+      - name: Build and install ms-sys
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/pbatard/ms-sys.git /tmp/ms-sys
+          cd /tmp/ms-sys
+          make
+          sudo make install
+          command -v ms-sys
+          ms-sys --help
+
+      - name: Verify build script
+        run: |
+          set -euxo pipefail
+          test -f wintogo/build/build-media.sh
+          bash -n wintogo/build/build-media.sh
+          bash wintogo/build/build-media.sh --help
+
+      - name: Download Windows ISO
+        env:
+          ISO_URL: ${{ inputs.windows_iso_url }}
+        run: |
+          set -euxo pipefail
+          mkdir -p downloads
+          curl -fL --retry 3 --retry-delay 5 \
+            "$ISO_URL" \
+            -o downloads/windows.iso
+
+          test -s downloads/windows.iso
+          ls -lh downloads/windows.iso
+          file downloads/windows.iso
+
+      - name: Inspect Windows ISO
+        run: |
+          set -euxo pipefail
+          7z l downloads/windows.iso > iso-list.txt
+
+          grep -iE 'sources/boot\.wim' iso-list.txt
+          grep -iE 'sources/install\.(wim|esd)' iso-list.txt
+          grep -iE 'bootmgr$' iso-list.txt
+          grep -iE 'boot/boot\.sdi' iso-list.txt
+
+      - name: Build BIOS installer image
+        run: |
+          set -euxo pipefail
+          chmod +x wintogo/build/build-media.sh
+
+          bash wintogo/build/build-media.sh \
+            --iso "$GITHUB_WORKSPACE/downloads/windows.iso" \
+            --boot-mode bios \
+            --out "$GITHUB_WORKSPACE/out"
+
+      - name: Verify output
+        run: |
+          set -euxo pipefail
+
+          test -s out/shimuefi-installer-bios.img
+          test -s out/manifest.txt
+
+          file out/shimuefi-installer-bios.img
+          cat out/manifest.txt
+          sha256sum out/shimuefi-installer-bios.img
+
+      - name: Upload BIOS installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShimUEFI-Windows-BIOS
+          path: |
+            out/shimuefi-installer-bios.img
+            out/manifest.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShimUEFI-build-diagnostics
+          path: |
+            iso-list.txt
+            downloads/
+          if-no-files-found: ignore
+          retention-days: 3
