@@ -2,14 +2,10 @@
 name: ShimUEFI BIOS Build
 
 on:
-  push:
-    branches:
-      - main
-      - wintogo
   workflow_dispatch:
     inputs:
       windows_iso_url:
-        description: "Direct download URL for your Windows 10/11 ISO"
+        description: "Direct download URL for the Windows ISO"
         required: true
         type: string
 
@@ -17,43 +13,22 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Run tests
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            bash coreutils grep sed gawk
-
-      - name: Check shell syntax
-        run: |
-          bash -n wintogo/build/build-media.sh
-          bash -n wintogo/tests/build-media-selftest.sh
-
-      - name: Run build self-tests
-        run: |
-          bash wintogo/tests/build-media-selftest.sh
-
-  bios-build:
-    name: Build Windows BIOS USB
-    needs: test
-    if: github.event_name == 'workflow_dispatch'
+  build:
+    name: Build Windows 10 BIOS media
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout
+      - name: Checkout ShimUEFI
         uses: actions/checkout@v4
 
-      - name: Install Linux build dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            build-essential \
+            git \
+            gettext \
             xorriso \
             wimtools \
             mtools \
@@ -62,7 +37,29 @@ jobs:
             coreutils \
             curl \
             wget \
-            unzip
+            unzip \
+            parted \
+            ntfs-3g
+
+      - name: Build and install ms-sys
+        run: |
+          git clone https://github.com/pbatard/ms-sys.git /tmp/ms-sys
+          cd /tmp/ms-sys
+          make
+          sudo make install
+          ms-sys --help
+
+      - name: Check build scripts
+        run: |
+          test -f wintogo/build/build-media.sh
+          test -f wintogo/tests/build-media-selftest.sh
+
+          bash -n wintogo/build/build-media.sh
+          bash -n wintogo/tests/build-media-selftest.sh
+
+      - name: Run build tests
+        run: |
+          bash wintogo/tests/build-media-selftest.sh
 
       - name: Download Windows ISO
         env:
@@ -70,13 +67,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p downloads
-          curl -fL --retry 3 "$ISO_URL" \
+
+          curl -fL --retry 3 \
+            "$ISO_URL" \
             -o downloads/windows.iso
 
           test -s downloads/windows.iso
 
+          echo "ISO downloaded:"
+          ls -lh downloads/windows.iso
+
       - name: Build BIOS media
         run: |
+          set -euo pipefail
+
           chmod +x wintogo/build/build-media.sh
 
           bash wintogo/build/build-media.sh \
@@ -84,11 +88,10 @@ jobs:
             --boot-mode bios \
             --out "$GITHUB_WORKSPACE/out"
 
-      - name: Upload BIOS build
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ShimUEFI-BIOS-USB
-          path: |
-            out/
+          name: ShimUEFI-Windows-BIOS
+          path: out/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
