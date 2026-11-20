@@ -89,6 +89,24 @@ xorriso)
     ;;
 
 # ---------------------------------------------------------------------------
+7z)
+    # Extraction mode: x -y <iso> -o<dir>. The fake ISO is a directory tree, so
+    # "extracting its UDF filesystem" is a copy of that tree.
+    output=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o*) output="${1#-o}" ;;
+        esac
+        shift
+    done
+    [ -n "$output" ] || { echo 'stub 7z: no -o directory' >&2; exit 2; }
+    [ -d "$fake_iso" ] || { echo "stub 7z: no ISO tree: $fake_iso" >&2; exit 2; }
+    mkdir -p "$output"
+    cp -R "$fake_iso"/. "$output"/
+    exit 0
+    ;;
+
+# ---------------------------------------------------------------------------
 wimlib-imagex)
     subcommand="${1:-}"
     case "$subcommand" in

@@ -219,7 +219,7 @@ zero data clusters and the base image is byte-identical.
 
 ### What has actually been verified
 
-- ✅ `build-media.sh` runs end to end against a simulated toolchain (65 checks),
+- ✅ `build-media.sh` runs end to end against a simulated toolchain (90 checks),
   including the BIOS/MBR image: 0x55AA signature, active FAT32 partition, the
   volume boot record at the 1 MiB offset, and `\bootmgr` + `\Boot\BCD` staged.
 - ✅ 75 unit tests pass on Windows PowerShell 5.1, the version WinPE ships.

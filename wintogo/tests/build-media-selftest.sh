@@ -66,7 +66,7 @@ assert_absent() {
 # ---------------------------------------------------------------------------
 
 chmod +x "$stub_lib"
-for tool in xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir sgdisk ms-sys sfdisk; do
+for tool in 7z xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir sgdisk ms-sys sfdisk; do
     cat > "$stub_dir/$tool" <<EOF
 #!/usr/bin/env bash
 exec "$stub_lib" "$tool" "\$@"
@@ -79,7 +79,7 @@ export FAKE_ISO="$fake_iso"
 export PATH="$stub_dir:$PATH"
 
 # Prove the stubs are what will be found, not something real on this machine.
-for tool in xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir sgdisk ms-sys sfdisk; do
+for tool in 7z xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir sgdisk ms-sys sfdisk; do
     resolved="$(command -v "$tool")"
     if [ "$resolved" != "$stub_dir/$tool" ]; then
         echo "PATH shadowing failed for $tool (found $resolved)" >&2
@@ -118,6 +118,19 @@ run_build() {
     # Each run starts from a clean simulated device state.
     rm -rf "$state_dir/fat" "$state_dir/wim" "$state_dir/sgdisk" "$state_dir/sfdisk"
     bash "$build_script" --iso "$fake_iso/win.iso-ignored" --out "$out_dir" "$@" > "$temp_root/last-run.log" 2>&1
+    return $?
+}
+
+# run_build_iso <iso-tree> <out-dir> [build-media.sh args...]
+# Builds against a different fake ISO tree, so firmware-specific ISO inspection
+# can be exercised with ISOs that carry only one boot chain.
+run_build_iso() {
+    local iso_tree="$1"
+    local out_dir="$2"
+    shift 2
+    rm -rf "$state_dir/fat" "$state_dir/wim" "$state_dir/sgdisk" "$state_dir/sfdisk"
+    STUB_STATE="$state_dir" FAKE_ISO="$iso_tree" bash "$build_script" \
+        --iso "$iso_tree/win.iso" --out "$out_dir" "$@" > "$temp_root/last-run.log" 2>&1
     return $?
 }
 
@@ -359,6 +372,104 @@ else
     pass 'BIOS mode refuses --iso-image'
 fi
 assert_contains "$temp_root/bad7.log" 'El Torito' 'the refusal explains why no ISO is built'
+
+# ---------------------------------------------------------------------------
+printf '\n== scenario 6: firmware-specific ISO inspection\n'
+# ---------------------------------------------------------------------------
+
+# A BIOS-only Windows ISO: \bootmgr and \boot\{BCD,boot.sdi} but no \EFI tree at
+# all. Requiring the EFI BCD unconditionally is what broke --boot-mode bios.
+bios_only_iso="$temp_root/bios-only-iso"
+mkdir -p "$bios_only_iso/sources" "$bios_only_iso/boot/fonts"
+dd if=/dev/zero of="$bios_only_iso/sources/install.wim" bs=1M count=1 status=none
+dd if=/dev/zero of="$bios_only_iso/sources/boot.wim" bs=1k count=64 status=none
+printf 'stub-bootmgr' > "$bios_only_iso/bootmgr"
+printf 'stub-bios-bcd' > "$bios_only_iso/boot/BCD"
+printf 'stub-sdi' > "$bios_only_iso/boot/boot.sdi"
+printf 'stub-bios-font' > "$bios_only_iso/boot/fonts/wgl4_boot.ttf"
+printf 'stub' > "$bios_only_iso/win.iso"
+
+out_bios="$temp_root/out12"
+if run_build_iso "$bios_only_iso" "$out_bios" --work "$temp_root/work12" \
+        --boot-mode bios --esp-size-mb 64; then
+    pass 'a BIOS-only ISO builds with --boot-mode bios'
+else
+    fail 'a BIOS-only ISO was refused in BIOS mode'
+    sed 's/^/       /' "$temp_root/last-run.log" | tail -20
+fi
+
+fat_bios="$state_dir/fat/shimuefi-esp.img.d"
+assert_file "$out_bios/shimuefi-installer-bios.img" 'the BIOS image was produced from a BIOS-only ISO'
+assert_file "$fat_bios/bootmgr" 'bootmgr is staged from a BIOS-only ISO'
+assert_file "$fat_bios/boot/BCD" 'boot/BCD is staged from a BIOS-only ISO'
+assert_file "$fat_bios/boot/boot.sdi" 'boot/boot.sdi is staged from a BIOS-only ISO'
+assert_file "$fat_bios/boot/fonts/wgl4_boot.ttf" 'the whole \boot directory is staged'
+assert_file "$fat_bios/sources/boot.wim" 'boot.wim is staged from a BIOS-only ISO'
+assert_absent "$fat_bios/EFI" 'no EFI boot files are staged in BIOS mode'
+
+# The same ISO must still be refused for a UEFI medium, and say why.
+if run_build_iso "$bios_only_iso" "$temp_root/out13" --work "$temp_root/work13" \
+        --boot-mode uefi; then
+    fail 'a BIOS-only ISO was accepted for a UEFI medium'
+else
+    pass 'a BIOS-only ISO is refused for a UEFI medium'
+fi
+assert_contains "$temp_root/last-run.log" 'EFI boot configuration' 'the UEFI refusal names the missing EFI BCD'
+assert_contains "$temp_root/last-run.log" 'not UEFI bootable' 'the UEFI refusal names the firmware it needs'
+assert_absent "$temp_root/out13/shimuefi-installer.img" 'no UEFI image is produced from a BIOS-only ISO'
+
+# A UEFI-only ISO: EFI boot files, no \bootmgr and no \boot directory.
+uefi_only_iso="$temp_root/uefi-only-iso"
+mkdir -p "$uefi_only_iso/sources" "$uefi_only_iso/EFI/Microsoft/Boot/fonts"
+dd if=/dev/zero of="$uefi_only_iso/sources/install.wim" bs=1M count=1 status=none
+dd if=/dev/zero of="$uefi_only_iso/sources/boot.wim" bs=1k count=64 status=none
+printf 'stub-bcd' > "$uefi_only_iso/EFI/Microsoft/Boot/BCD"
+printf 'stub-bootmgfw' > "$uefi_only_iso/EFI/Microsoft/Boot/bootmgfw.efi"
+printf 'stub-font' > "$uefi_only_iso/EFI/Microsoft/Boot/fonts/chs_boot.ttf"
+printf 'stub' > "$uefi_only_iso/win.iso"
+
+out_uefi="$temp_root/out14"
+if run_build_iso "$uefi_only_iso" "$out_uefi" --work "$temp_root/work14" --esp-size-mb 64; then
+    pass 'a UEFI-only ISO builds in the default UEFI mode'
+else
+    fail 'a UEFI-only ISO was refused in UEFI mode'
+    sed 's/^/       /' "$temp_root/last-run.log" | tail -20
+fi
+
+fat_uefi="$state_dir/fat/shimuefi-esp.img.d"
+assert_file "$out_uefi/shimuefi-installer.img" 'the UEFI image was produced from a UEFI-only ISO'
+assert_file "$fat_uefi/EFI/Boot/BOOTX64.EFI" 'the fallback loader is staged in UEFI mode'
+assert_file "$fat_uefi/EFI/Microsoft/Boot/BCD" 'the EFI BCD is staged in UEFI mode'
+assert_file "$fat_uefi/EFI/Microsoft/Boot/bootmgfw.efi" 'bootmgfw.efi is staged in UEFI mode'
+assert_absent "$fat_uefi/bootmgr" 'no BIOS bootmgr is staged in UEFI mode'
+assert_absent "$fat_uefi/boot" 'no BIOS \boot directory is staged in UEFI mode'
+
+if run_build_iso "$uefi_only_iso" "$temp_root/out15" --work "$temp_root/work15" \
+        --boot-mode bios; then
+    fail 'a UEFI-only ISO was accepted for a BIOS medium'
+else
+    pass 'a UEFI-only ISO is refused for a BIOS medium'
+fi
+assert_contains "$temp_root/last-run.log" 'bootmgr' 'the BIOS refusal names the missing bootmgr'
+assert_contains "$temp_root/last-run.log" 'not BIOS bootable' 'the BIOS refusal names the firmware it needs'
+
+# \boot\boot.sdi is what starts the WinPE image, so BIOS mode requires it.
+no_sdi_iso="$temp_root/bios-no-sdi-iso"
+mkdir -p "$no_sdi_iso/sources" "$no_sdi_iso/boot"
+dd if=/dev/zero of="$no_sdi_iso/sources/install.wim" bs=1M count=1 status=none
+dd if=/dev/zero of="$no_sdi_iso/sources/boot.wim" bs=1k count=64 status=none
+printf 'stub-bootmgr' > "$no_sdi_iso/bootmgr"
+printf 'stub-bios-bcd' > "$no_sdi_iso/boot/BCD"
+printf 'stub' > "$no_sdi_iso/win.iso"
+
+if run_build_iso "$no_sdi_iso" "$temp_root/out16" --work "$temp_root/work16" \
+        --boot-mode bios; then
+    fail 'a BIOS ISO without boot.sdi was accepted'
+else
+    pass 'a BIOS ISO without boot.sdi is refused'
+fi
+assert_contains "$temp_root/last-run.log" 'boot.sdi' 'the refusal names the missing boot.sdi'
+assert_absent "$temp_root/out16/shimuefi-installer-bios.img" 'no BIOS image is produced without boot.sdi'
 
 # ---------------------------------------------------------------------------
 printf '\n== summary ==\n'

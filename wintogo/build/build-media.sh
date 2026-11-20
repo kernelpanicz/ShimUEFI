@@ -318,16 +318,29 @@ if [ -z "$install_image_path" ]; then
 fi
 [ -n "$install_image_path" ] || die "this ISO has no sources/install.wim or install.esd"
 
-bcd_path="$(iso_find BCD /EFI/Microsoft/Boot)"
-bootmgfw_path="$(iso_find bootmgfw.efi /EFI/Microsoft/Boot)"
-[ -n "$bcd_path" ] || die "this ISO has no EFI boot configuration (BCD)"
-[ -n "$bootmgfw_path" ] || die "this ISO has no bootmgfw.efi; it is not UEFI bootable"
+# Each firmware reads a different boot chain off the medium, so only the files
+# that the selected mode actually loads are required. A UEFI medium needs the EFI
+# BCD and bootmgfw.efi; a BIOS medium needs \bootmgr and \boot\BCD instead, and
+# neither mode may demand the other's files. Full Windows installation ISOs ship
+# both chains, but a BIOS-only ISO must not be refused for lacking the EFI ones.
+bcd_path=""
+bootmgfw_path=""
+bios_bootmgr_path=""
+bios_boot_dir=""
 
-if [ "$boot_mode" = "bios" ]; then
+if [ "$boot_mode" = "uefi" ]; then
+    bcd_path="$(iso_find BCD /EFI/Microsoft/Boot)"
+    bootmgfw_path="$(iso_find bootmgfw.efi /EFI/Microsoft/Boot)"
+    [ -n "$bcd_path" ] || die "this ISO has no EFI boot configuration (EFI/Microsoft/Boot/BCD); it is not UEFI bootable. Use --boot-mode bios for a BIOS-only ISO"
+    [ -n "$bootmgfw_path" ] || die "this ISO has no EFI/Microsoft/Boot/bootmgfw.efi; it is not UEFI bootable. Use --boot-mode bios for a BIOS-only ISO"
+else
     bios_bootmgr_path="$(iso_find bootmgr /)"
-    [ -n "$bios_bootmgr_path" ] || die "this ISO has no \\bootmgr at its root; it is not BIOS bootable"
+    bios_bcd_path="$(iso_find BCD /boot)"
     bios_boot_sdi="$(iso_find boot.sdi /boot)"
-    [ -n "$bios_boot_sdi" ] || die "this ISO has no \\boot\\boot.sdi; it is not BIOS bootable"
+    [ -n "$bios_bootmgr_path" ] || die "this ISO has no \\bootmgr at its root; it is not BIOS bootable. Use --boot-mode uefi for a UEFI-only ISO"
+    [ -n "$bios_bcd_path" ] || die "this ISO has no \\boot\\BCD; it is not BIOS bootable. Use --boot-mode uefi for a UEFI-only ISO"
+    [ -n "$bios_boot_sdi" ] || die "this ISO has no \\boot\\boot.sdi; it is not BIOS bootable. Use --boot-mode uefi for a UEFI-only ISO"
+    # \boot\BCD, boot.sdi and the boot fonts share one directory, staged whole.
     bios_boot_dir="$(dirname "$bios_boot_sdi")"
     info "BIOS loader:     $bios_bootmgr_path"
     info "BIOS boot files: $bios_boot_dir"
@@ -335,7 +348,9 @@ fi
 
 info "boot image:      $boot_wim_path"
 info "install image:   $install_image_path"
-info "boot manager:    $bootmgfw_path"
+if [ "$boot_mode" = "uefi" ]; then
+    info "boot manager:    $bootmgfw_path"
+fi
 
 # ---------------------------------------------------------------------------
 # Stage the medium tree
@@ -343,20 +358,22 @@ info "boot manager:    $bootmgfw_path"
 
 step "staging medium contents"
 rm -rf "$work_dir/stage" "$work_dir/payload"
-mkdir -p "$work_dir/stage/EFI/Boot" "$work_dir/stage/EFI/Microsoft/Boot" "$work_dir/stage/sources" "$work_dir/payload/wintogo"
+mkdir -p "$work_dir/stage/sources" "$work_dir/payload/wintogo"
 
-iso_extract "$bootmgfw_path" "$work_dir/stage/EFI/Microsoft/Boot/bootmgfw.efi"
-cp "$work_dir/stage/EFI/Microsoft/Boot/bootmgfw.efi" "$work_dir/stage/EFI/Boot/BOOTX64.EFI"
-iso_extract "$bcd_path" "$work_dir/stage/EFI/Microsoft/Boot/BCD"
+if [ "$boot_mode" = "uefi" ]; then
+    mkdir -p "$work_dir/stage/EFI/Boot" "$work_dir/stage/EFI/Microsoft/Boot"
+    iso_extract "$bootmgfw_path" "$work_dir/stage/EFI/Microsoft/Boot/bootmgfw.efi"
+    cp "$work_dir/stage/EFI/Microsoft/Boot/bootmgfw.efi" "$work_dir/stage/EFI/Boot/BOOTX64.EFI"
+    iso_extract "$bcd_path" "$work_dir/stage/EFI/Microsoft/Boot/BCD"
 
-fonts_path="$(iso_find fonts /EFI/Microsoft/Boot)"
-if [ -n "$fonts_path" ]; then
-    iso_extract "$fonts_path" "$work_dir/stage/EFI/Microsoft/Boot/fonts"
-fi
-
-if [ "$boot_mode" = "bios" ]; then
-    # The BIOS chain reads \bootmgr and \boot\BCD (plus boot.sdi and fonts) from
-    # the same FAT partition, so the medium can start on either firmware.
+    fonts_path="$(iso_find fonts /EFI/Microsoft/Boot)"
+    if [ -n "$fonts_path" ]; then
+        iso_extract "$fonts_path" "$work_dir/stage/EFI/Microsoft/Boot/fonts"
+    fi
+else
+    # Legacy firmware loads \bootmgr, which reads \boot\BCD, boot.sdi and the
+    # boot fonts from that same partition, so the whole \boot directory travels
+    # with it. No EFI boot files are staged or needed in this mode.
     iso_extract "$bios_bootmgr_path" "$work_dir/stage/bootmgr"
     iso_extract "$bios_boot_dir" "$work_dir/stage/boot"
     info "staged the BIOS boot chain (bootmgr + $(basename "$bios_boot_dir"))"
@@ -520,7 +537,13 @@ done )
 done )
 
 step "verifying the FAT32 image"
-for required in EFI/Boot/BOOTX64.EFI EFI/Microsoft/Boot/BCD EFI/Microsoft/Boot/bootmgfw.efi sources/boot.wim; do
+# Only the boot chain the selected firmware will read has to be present.
+if [ "$boot_mode" = "uefi" ]; then
+    required_files="EFI/Boot/BOOTX64.EFI EFI/Microsoft/Boot/BCD EFI/Microsoft/Boot/bootmgfw.efi sources/boot.wim"
+else
+    required_files="bootmgr boot/BCD boot/boot.sdi sources/boot.wim"
+fi
+for required in $required_files; do
     if mdir -i "$fat_image" "::/$required" >/dev/null 2>&1; then
         info "present: $required"
     else
