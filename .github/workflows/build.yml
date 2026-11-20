@@ -1,0 +1,94 @@
+
+name: ShimUEFI BIOS Build
+
+on:
+  push:
+    branches:
+      - main
+      - wintogo
+  workflow_dispatch:
+    inputs:
+      windows_iso_url:
+        description: "Direct download URL for your Windows 10/11 ISO"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bash coreutils grep sed gawk
+
+      - name: Check shell syntax
+        run: |
+          bash -n wintogo/build/build-media.sh
+          bash -n wintogo/tests/build-media-selftest.sh
+
+      - name: Run build self-tests
+        run: |
+          bash wintogo/tests/build-media-selftest.sh
+
+  bios-build:
+    name: Build Windows BIOS USB
+    needs: test
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xorriso \
+            wimtools \
+            mtools \
+            dosfstools \
+            gdisk \
+            coreutils \
+            curl \
+            wget \
+            unzip
+
+      - name: Download Windows ISO
+        env:
+          ISO_URL: ${{ inputs.windows_iso_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p downloads
+          curl -fL --retry 3 "$ISO_URL" \
+            -o downloads/windows.iso
+
+          test -s downloads/windows.iso
+
+      - name: Build BIOS media
+        run: |
+          chmod +x wintogo/build/build-media.sh
+
+          bash wintogo/build/build-media.sh \
+            --iso "$GITHUB_WORKSPACE/downloads/windows.iso" \
+            --boot-mode bios \
+            --out "$GITHUB_WORKSPACE/out"
+
+      - name: Upload BIOS build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShimUEFI-BIOS-USB
+          path: |
+            out/
+          if-no-files-found: error
+          retention-days: 7
