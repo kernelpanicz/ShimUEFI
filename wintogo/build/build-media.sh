@@ -457,11 +457,30 @@ case "${wim_index:-}" in
     *) warn "boot.wim image 1 is $wim_index; this project targets x86-64 Windows" ;;
 esac
 
-wimlib-imagex update "$work_dir/stage/sources/boot.wim" 1 \
-    --command="add '$work_dir/payload/wintogo' '/wintogo'" \
-    --command="add '$work_dir/payload/winpeshl.ini' '/Windows/System32/winpeshl.ini'" \
-    --command="add '$runtime_dir/startnet.cmd' '/Windows/System32/startnet.cmd'" \
-    --boot >/dev/null
+# wimlib-imagex accepts --command only once: a second one is an error, and every
+# current release tells you to feed the update commands on standard input
+# instead. A path containing a space cannot survive an unquoted command line
+# either. So build the update script - one command per line, arguments quoted the
+# way wimlib's own parser expects - and redirect it into the update call.
+for wim_source in "$work_dir/payload/wintogo" "$work_dir/payload/winpeshl.ini" "$runtime_dir/startnet.cmd"; do
+    case "$wim_source" in
+        *\'*|*$'\n'*)
+            die "cannot pass '$wim_source' to wimlib-imagex: its command syntax cannot quote a single quote or a newline. Build from a path that contains neither."
+            ;;
+    esac
+done
+
+wim_quote() { printf "'%s'" "$1"; }
+
+wim_update_script="$work_dir/boot-wim-update.txt"
+{
+    printf 'add %s %s\n' "$(wim_quote "$work_dir/payload/wintogo")" "'/wintogo'"
+    printf 'add %s %s\n' "$(wim_quote "$work_dir/payload/winpeshl.ini")" "'/Windows/System32/winpeshl.ini'"
+    printf 'add %s %s\n' "$(wim_quote "$runtime_dir/startnet.cmd")" "'/Windows/System32/startnet.cmd'"
+} > "$wim_update_script"
+
+wimlib-imagex update "$work_dir/stage/sources/boot.wim" 1 --boot \
+    < "$wim_update_script" >/dev/null
 
 step "checking the patched boot image"
 if wimlib-imagex dir "$work_dir/stage/sources/boot.wim" 1 2>/dev/null | grep -qi 'wintogo.ps1'; then

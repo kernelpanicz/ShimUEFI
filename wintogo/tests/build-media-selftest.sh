@@ -472,6 +472,59 @@ assert_contains "$temp_root/last-run.log" 'boot.sdi' 'the refusal names the miss
 assert_absent "$temp_root/out16/shimuefi-installer-bios.img" 'no BIOS image is produced without boot.sdi'
 
 # ---------------------------------------------------------------------------
+printf '\n== scenario 7: boot.wim is patched through stdin, paths with spaces\n'
+# ---------------------------------------------------------------------------
+
+# Current wimlib rejects a second --command and wants the update commands on
+# standard input, so the build must not put them on the command line at all. A
+# work directory with spaces in it also proves the arguments are quoted for
+# wimlib's own parser rather than silently split.
+spaced_work="$temp_root/a work dir with spaces"
+spaced_out="$temp_root/out with spaces"
+mkdir -p "$spaced_work"
+
+if run_build "$spaced_out" --work "$spaced_work" --esp-size-mb 64 --no-split; then
+    pass 'build-media.sh builds from a work directory containing spaces'
+else
+    fail 'build-media.sh failed with a work directory containing spaces'
+    sed 's/^/       /' "$temp_root/last-run.log" | tail -20
+fi
+
+assert_file "$spaced_out/shimuefi-installer.img" 'the image was produced from a spaced work directory'
+
+wim_commands="$state_dir/wim/boot.wim.commands"
+wim_payload="$state_dir/wim/boot.wim.entries"
+assert_file "$wim_commands" 'the update commands were written to a file for stdin'
+
+if [ "$(grep -c '^add ' "$wim_commands" 2>/dev/null || true)" = "3" ]; then
+    pass 'all three payloads are passed to wimlib-imagex in one invocation'
+else
+    fail 'expected 3 add commands, got: '"$(grep -c '^add ' "$wim_commands" 2>/dev/null || true)"
+fi
+assert_contains "$wim_commands" "^add '$spaced_work/payload/wintogo' '/wintogo'$" 'the payload directory is quoted and added'
+assert_contains "$wim_commands" '^add .*'\''/Windows/System32/winpeshl.ini'\''$' 'winpeshl.ini is quoted and added'
+assert_contains "$wim_commands" '^add .*'\''/Windows/System32/startnet.cmd'\''$' 'startnet.cmd is quoted and added'
+assert_contains "$wim_commands" '/a work dir with spaces/payload/wintogo' 'the spaced source path reaches wimlib intact'
+
+assert_contains "$wim_payload" '^/wintogo/wintogo.ps1$' 'the installer script is in boot.wim'
+assert_contains "$wim_payload" '^/wintogo/engine/WinToGo.Guard.psm1$' 'the engine is in boot.wim'
+assert_contains "$wim_payload" '^/Windows/System32/winpeshl.ini$' 'winpeshl.ini is in boot.wim'
+assert_contains "$wim_payload" '^/Windows/System32/startnet.cmd$' 'startnet.cmd is in boot.wim'
+
+assert_not_contains "$state_dir/calls.log" '--command' 'the update commands are not passed with --command'
+assert_contains "$state_dir/calls.log" '--boot' 'boot.wim is still marked as the boot image'
+
+# wimlib's command syntax cannot represent a single quote, so such a path must be
+# refused outright rather than written into a command that mis-parses.
+quoted_work="$temp_root/an 'odd' work dir"
+if run_build "$temp_root/out18" --work "$quoted_work" --esp-size-mb 64; then
+    fail 'a work path that wimlib cannot quote was accepted'
+else
+    pass 'a work path containing a single quote is refused'
+fi
+assert_contains "$temp_root/last-run.log" 'cannot quote a single quote' 'the refusal explains the quoting limit'
+
+# ---------------------------------------------------------------------------
 printf '\n== summary ==\n'
 if [ "$failures" -ne 0 ]; then
     printf '\033[1;31m%d of %d checks failed\033[0m\n' "$failures" "$checks"

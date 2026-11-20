@@ -258,7 +258,7 @@ gives first-boot specialization.
 
 | Layer | How it is tested | Status |
 |---|---|---|
-| `build-media.sh` | Self-test runs the real script end to end with a simulated 7z/xorriso/wimlib/mtools/sgdisk/ms-sys/sfdisk on PATH and asserts on the produced FAT contents, patched WIM, split parts, manifest, ISO, single-USB layout, BIOS/MBR structures, firmware-specific ISO inspection and the refusal cases | Passing (90 checks) |
+| `build-media.sh` | Self-test runs the real script end to end with a simulated 7z/xorriso/wimlib/mtools/sgdisk/ms-sys/sfdisk on PATH and asserts on the produced FAT contents, patched WIM, split parts, manifest, ISO, single-USB layout, BIOS/MBR structures, firmware-specific ISO inspection and the refusal cases | Passing (106 checks) |
 | Classification, authorization, protection plan, layouts | 75 unit tests with synthetic disk records, including eMMC/UFS/NVMe/SATA/SD/system-disk cases and the GPT and MBR layouts | Passing |
 | A real BIOS boot on hardware | `ms-sys`, `bootsect.exe` and SeaBIOS loading `\bootmgr` | **Not run** — no Chromebook or legacy firmware here |
 | Pipeline command generation | Unit test records every executor call during a full install with an internal disk attached and fails if any command names it | Passing |

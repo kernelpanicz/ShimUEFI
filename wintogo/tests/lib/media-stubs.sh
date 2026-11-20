@@ -16,6 +16,7 @@
 #   $STUB_STATE/fat/<image>.d/<path>         the "filesystem" of each FAT image
 #   $STUB_STATE/fat/<image>.formatted
 #   $STUB_STATE/wim/<image>.entries          files added to each WIM
+#   $STUB_STATE/wim/<image>.commands         the update commands read from stdin
 #   $STUB_STATE/sgdisk/<image>.args
 #
 # Invoked as: media-stubs.sh <tool-name> [args...]
@@ -34,6 +35,53 @@ printf '%s|%s\n' "$tool" "$*" >> "$state/calls.log"
 fat_root() {
     local image="$1"
     printf '%s/fat/%s.d' "$state" "$(basename "$image")"
+}
+
+# split_command_line <line>
+# Splits one wimlib update command line into REPLY_TOKENS. wimlib parses its
+# command file itself, so an argument with whitespace in it arrives quoted.
+REPLY_TOKENS=()
+split_command_line() {
+    local line="$1"
+    local length="${#line}"
+    local index=0
+    local char=""
+    local current=""
+    local quote=""
+    local have=0
+    REPLY_TOKENS=()
+    while [ "$index" -lt "$length" ]; do
+        char="${line:$index:1}"
+        if [ -n "$quote" ]; then
+            if [ "$char" = "$quote" ]; then
+                quote=""
+            else
+                current="$current$char"
+            fi
+        else
+            case "$char" in
+                ' '|$'\t')
+                    if [ "$have" -eq 1 ]; then
+                        REPLY_TOKENS+=("$current")
+                        current=""
+                        have=0
+                    fi
+                    ;;
+                "'"|'"')
+                    quote="$char"
+                    have=1
+                    ;;
+                *)
+                    current="$current$char"
+                    have=1
+                    ;;
+            esac
+        fi
+        index=$((index + 1))
+    done
+    if [ "$have" -eq 1 ]; then
+        REPLY_TOKENS+=("$current")
+    fi
 }
 
 case "$tool" in
@@ -122,32 +170,46 @@ wimlib-imagex)
         update)
             image="$2"
             entries="$state/wim/$(basename "$image").entries"
+            commands_file="$state/wim/$(basename "$image").commands"
             touch "$entries"
             shift 2
             for argument in "$@"; do
                 case "$argument" in
+                    --boot|--check|--no-acls|--strict-acls|--rebuild|--threads=*) ;;
                     --command=*)
-                        command_text="${argument#--command=}"
-                        # Expected forms: add '<src>' '<dest>'
-                        action="${command_text%% *}"
-                        [ "$action" = "add" ] || continue
-                        remainder="${command_text#add }"
-                        remainder="$(printf '%s' "$remainder" | tr -d "'\"")"
-                        source_item="${remainder%% *}"
-                        destination_item="${remainder#* }"
-                        if [ -d "$source_item" ]; then
-                            ( cd "$source_item" && find . -type f | sed 's|^\./||' ) | while read -r relative; do
-                                printf '%s/%s\n' "${destination_item%/}" "$relative" >> "$entries"
-                            done
-                        elif [ -f "$source_item" ]; then
-                            printf '%s\n' "$destination_item" >> "$entries"
-                        else
-                            echo "stub wimlib: no such source: $source_item" >&2
-                            exit 2
-                        fi
+                        # Current wimlib refuses more than one --command and asks
+                        # for the update commands on standard input instead.
+                        echo 'stub wimlib: --command is not supported; pass update commands on stdin' >&2
+                        exit 2
                         ;;
                 esac
             done
+            : > "$commands_file"
+            if [ ! -t 0 ]; then
+                cat >> "$commands_file"
+            fi
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                split_command_line "$line"
+                [ "${REPLY_TOKENS[0]:-}" = "add" ] || continue
+                # Expected form: add '<src>' '<dest>'
+                source_item="${REPLY_TOKENS[1]:-}"
+                destination_item="${REPLY_TOKENS[2]:-}"
+                if [ -z "$source_item" ] || [ -z "$destination_item" ]; then
+                    echo "stub wimlib: malformed add command: $line" >&2
+                    exit 2
+                fi
+                if [ -d "$source_item" ]; then
+                    ( cd "$source_item" && find . -type f | sed 's|^\./||' ) | while read -r relative; do
+                        printf '%s/%s\n' "${destination_item%/}" "$relative" >> "$entries"
+                    done
+                elif [ -f "$source_item" ]; then
+                    printf '%s\n' "$destination_item" >> "$entries"
+                else
+                    echo "stub wimlib: no such source: $source_item" >&2
+                    exit 2
+                fi
+            done < "$commands_file"
             exit 0
             ;;
         split)
