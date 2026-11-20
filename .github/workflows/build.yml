@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       windows_iso_url:
-        description: "Direct download URL for the Windows ISO"
+        description: "Direct download URL for the Windows 10 LTSC 2019 ISO"
         required: true
         type: string
 
@@ -14,12 +14,12 @@ permissions:
 
 jobs:
   build:
-    name: Build Windows 10 BIOS media
+    name: Build Windows BIOS USB
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout ShimUEFI
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install dependencies
@@ -39,18 +39,26 @@ jobs:
             wget \
             unzip \
             parted \
-            ntfs-3g
+            ntfs-3g \
+            p7zip-full
 
       - name: Build and install ms-sys
         run: |
+          set -euxo pipefail
           git clone https://github.com/pbatard/ms-sys.git /tmp/ms-sys
           cd /tmp/ms-sys
           make
           sudo make install
-          ms-sys --help
+          command -v ms-sys
+          ms-sys --help || true
 
-      - name: Check build scripts
+      - name: Verify project scripts
         run: |
+          set -euo pipefail
+
+          echo "Repository contents:"
+          find . -maxdepth 4 -type f | sort | head -250
+
           test -f wintogo/build/build-media.sh
           test -f wintogo/tests/build-media-selftest.sh
 
@@ -59,6 +67,7 @@ jobs:
 
       - name: Run build tests
         run: |
+          set -euo pipefail
           bash wintogo/tests/build-media-selftest.sh
 
       - name: Download Windows ISO
@@ -66,9 +75,12 @@ jobs:
           ISO_URL: ${{ inputs.windows_iso_url }}
         run: |
           set -euo pipefail
+
           mkdir -p downloads
 
-          curl -fL --retry 3 \
+          curl -fL \
+            --retry 3 \
+            --retry-delay 5 \
             "$ISO_URL" \
             -o downloads/windows.iso
 
@@ -76,6 +88,20 @@ jobs:
 
           echo "ISO downloaded:"
           ls -lh downloads/windows.iso
+          file downloads/windows.iso
+
+      - name: Inspect Windows ISO
+        run: |
+          set -euo pipefail
+
+          echo "ISO directory listing:"
+          7z l downloads/windows.iso
+
+          echo "Checking Windows boot image..."
+          7z l downloads/windows.iso | grep -iE 'sources/boot\.wim$'
+
+          echo "Checking Windows installation image..."
+          7z l downloads/windows.iso | grep -iE 'sources/install\.(wim|esd)$'
 
       - name: Build BIOS media
         run: |
@@ -88,10 +114,28 @@ jobs:
             --boot-mode bios \
             --out "$GITHUB_WORKSPACE/out"
 
-      - name: Upload build artifacts
+      - name: List build output
+        if: success()
+        run: |
+          echo "Build output:"
+          find out -maxdepth 3 -type f -printf '%p (%s bytes)\n'
+
+      - name: Upload BIOS media
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ShimUEFI-Windows-BIOS
           path: out/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShimUEFI-build-diagnostics
+          path: |
+            downloads/
+            out/
+          if-no-files-found: ignore
+          retention-days: 3
