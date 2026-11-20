@@ -2,15 +2,18 @@
 #
 # Partition layout for the installation target.
 #
-# Two layouts exist:
+# Three layouts exist:
 #
 #   Fresh      the target is a whole empty disk: GPT with ESP + MSR + Windows.
 #   SingleUsb  the target is the installer medium itself, so its GPT already
 #              carries ESP + MSR + an empty Windows partition from the build and
 #              only the Windows partition is formatted.
+#   Legacy     the target is a whole empty disk on BIOS firmware: MBR with one
+#              active FAT32 boot partition and one NTFS Windows partition.
 #
-# UEFI-only, GPT only. An MBR install cannot be booted by UEFI firmware, and
-# offering it would produce media that appears to work and then does not.
+# The style is not a preference: UEFI firmware cannot boot an MBR disk on most
+# implementations, and BIOS firmware cannot boot a GPT ESP at all. The installer
+# refuses a layout that does not match the firmware it is running on.
 #
 # Copyright (C) 2026 ShimUEFI contributors
 # Licensed under the GNU GPL v3. See LICENSE.
@@ -185,6 +188,98 @@ function Test-WtgSingleUsbTarget {
     }
 }
 
+function New-WtgLegacyLayoutPlan {
+    <#
+    .SYNOPSIS
+        Computes the MBR partition layout for a whole empty target disk on BIOS
+        firmware.
+
+    .DESCRIPTION
+        The BIOS boot chain is MBR -> active partition -> \bootmgr -> \Boot\BCD ->
+        \Windows\System32\winload.exe. The boot files must live on the active
+        partition, so this layout reserves one for them and gives the rest to
+        Windows.
+
+        MBR cannot address a partition beyond 2 TiB, so a disk at or above that
+        boundary is refused instead of being partitioned into an extent the
+        firmware cannot reach.
+
+    .PARAMETER DiskSize
+        Capacity of the target disk in bytes.
+
+    .OUTPUTS
+        Partitions[]  Name, Type, StartBytes, SizeBytes, SizeMB
+        Valid, Errors, UnallocatedBytes, Style
+    #>
+    param(
+        [Parameter(Mandatory = $true)][long]$DiskSize,
+        [int]$BootSizeMB = 512,
+        [long]$MinimumWindowsBytes = 25GB,
+        [int]$AlignmentBytes = 1MB
+    )
+
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($BootSizeMB -lt 260) { $errors.Add('the BIOS boot partition must be at least 260 MB') }
+    if ($AlignmentBytes -lt 4096) { $errors.Add('alignment must be at least 4 KiB') }
+
+    # 2 TiB, not 2 TB: the limit is 32 addressable bits of 512-byte sectors.
+    $mbrLimitBytes = [long]2TB
+    if ($DiskSize -ge $mbrLimitBytes) {
+        $errors.Add(('a {0:N1} GB disk is at or beyond the 2 TiB limit of an MBR partition table, so BIOS firmware cannot address it' -f ($DiskSize / $script:GiB)))
+    }
+
+    $front = [long]$script:FrontReserveBytes
+    $usable = [long]$DiskSize - $front
+    $bootBytes = [long]$BootSizeMB * $script:MiB
+    $windowsBytes = $usable - $bootBytes
+
+    if ($windowsBytes -lt $MinimumWindowsBytes) {
+        $errors.Add(('a {0:N1} GB disk leaves only {1:N1} GB for Windows after the boot partition, which is below the {2:N0} GB minimum' -f `
+            ($DiskSize / $script:GiB), ($windowsBytes / $script:GiB), ($MinimumWindowsBytes / $script:GiB)))
+    }
+
+    if ($errors.Count -gt 0) {
+        return [pscustomobject]@{
+            Valid            = $false
+            Errors           = $errors.ToArray()
+            Partitions       = @()
+            DiskSize         = $DiskSize
+            UnallocatedBytes = 0
+            Style            = 'Mbr'
+        }
+    }
+
+    $align = {
+        param([long]$value, [int]$alignment)
+        $remainder = $value % $alignment
+        if ($remainder -eq 0) { return $value }
+        return $value + ($alignment - $remainder)
+    }
+
+    $partitions = New-Object 'System.Collections.Generic.List[object]'
+    $cursor = & $align $front $AlignmentBytes
+
+    $partitions.Add([pscustomobject]@{ Name = 'Boot';    Type = 'boot';    StartBytes = $cursor; SizeBytes = $bootBytes;    SizeMB = $BootSizeMB })
+    $cursor = & $align ($cursor + $bootBytes) $AlignmentBytes
+
+    $partitions.Add([pscustomobject]@{ Name = 'Windows'; Type = 'primary'; StartBytes = $cursor; SizeBytes = $windowsBytes; SizeMB = [int][math]::Floor($windowsBytes / $script:MiB) })
+    $cursor = & $align ($cursor + $windowsBytes) $AlignmentBytes
+
+    # No backup table exists in MBR, so nothing is held back at the end.
+    $unallocated = if ($cursor -lt $DiskSize) { [long]$DiskSize - $cursor } else { 0L }
+
+    return [pscustomobject]@{
+        Valid            = $true
+        Errors           = @()
+        Partitions       = $partitions.ToArray()
+        DiskSize         = $DiskSize
+        UnallocatedBytes = $unallocated
+        WindowsBytes     = $windowsBytes
+        Style            = 'Mbr'
+    }
+}
+
 function Format-WtgLayout {
     <#
     .SYNOPSIS
@@ -203,4 +298,9 @@ function Format-WtgLayout {
     return ($lines -join [Environment]::NewLine)
 }
 
-Export-ModuleMember -Function @('New-WtgLayoutPlan', 'Test-WtgSingleUsbTarget', 'Format-WtgLayout')
+Export-ModuleMember -Function @(
+    'New-WtgLayoutPlan',
+    'New-WtgLegacyLayoutPlan',
+    'Test-WtgSingleUsbTarget',
+    'Format-WtgLayout'
+)

@@ -109,4 +109,37 @@ Test-Case 'a null layout renders an explanation instead of failing' {
     Assert-Contains $text 'single-USB'
 }
 
+Test-Case 'a BIOS target gets an active boot partition and a Windows partition' {
+    $plan = New-WtgLegacyLayoutPlan -DiskSize 512GB
+    Assert-True $plan.Valid ($plan.Errors -join '; ')
+    Assert-Equal 'Mbr' $plan.Style
+    Assert-Equal 2 $plan.Partitions.Count
+    Assert-Equal 'Boot' $plan.Partitions[0].Name
+    Assert-Equal 512 $plan.Partitions[0].SizeMB
+    Assert-Equal 'Windows' $plan.Partitions[1].Name
+    Assert-Equal 0 ($plan.Partitions[0].StartBytes % 1MB)
+    Assert-Equal 0 ($plan.Partitions[1].StartBytes % 1MB)
+    Assert-True (($plan.Partitions[1].StartBytes + $plan.Partitions[1].SizeBytes) -le 512GB) 'the Windows partition runs past the end of the disk'
+    Assert-True ($plan.Partitions[1].SizeBytes -gt 450GB) 'Windows should get the remainder'
+}
+
+Test-Case 'a BIOS layout on a disk too small for Windows is rejected' {
+    $plan = New-WtgLegacyLayoutPlan -DiskSize 20GB
+    Assert-False $plan.Valid
+    Assert-True (($plan.Errors -join ' ') -match 'below the')
+    Assert-Equal 0 $plan.Partitions.Count
+}
+
+Test-Case 'a disk beyond the 2 TiB MBR limit is rejected for BIOS' {
+    $plan = New-WtgLegacyLayoutPlan -DiskSize 3TB
+    Assert-False $plan.Valid
+    Assert-True (($plan.Errors -join ' ') -match '2 TiB')
+}
+
+Test-Case 'an undersized BIOS boot partition is rejected' {
+    $plan = New-WtgLegacyLayoutPlan -DiskSize 512GB -BootSizeMB 100
+    Assert-False $plan.Valid
+    Assert-True (($plan.Errors -join ' ') -match 'boot partition')
+}
+
 Complete-WtgTestRun 'Layout.Tests'

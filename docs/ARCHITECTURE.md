@@ -110,7 +110,14 @@ authorization, never templated with a stale number.
 
 ## 4. Layout decisions
 
-GPT, three partitions, UEFI only:
+The partition style follows the firmware: GPT for UEFI, MBR for BIOS. That is not
+a preference — UEFI firmware cannot start an MBR disk on most implementations, and
+BIOS firmware cannot start a GPT disk at all. `Get-WtgFirmwareMode` answers once,
+the runtime derives both the layout and the installation mode from it, and
+`Invoke-WtgInstall` refuses a layout that does not match the firmware it is
+given.
+
+### UEFI/GPT layout
 
 | Partition | Size | Type | Filesystem |
 |---|---|---|---|
@@ -124,8 +131,8 @@ GPT, three partitions, UEFI only:
 - **1 MiB alignment** at every boundary: correct on 512-byte and 4K-native disks,
   and what Windows itself uses on GPT.
 - **1 MiB reserved at each end** of the disk for the primary and backup GPT.
-- **No MBR path**: an MBR installation cannot boot under UEFI, and offering it
-  would create media that appears to work and then does not.
+- **No MBR path in UEFI mode**: an MBR installation cannot boot under UEFI, so the
+  two layouts are kept separate rather than merged into one "universal" layout.
 - **`EFI/BOOT/BOOTX64.EFI` alongside `EFI/Microsoft/Boot/bootmgfw.efi`**: firmware
   fallback paths vary wildly between vendors; the fallback copy is what makes the
   disk boot on an unfamiliar machine. `Confirm-WtgFallbackLoader` places it when
@@ -133,6 +140,44 @@ GPT, three partitions, UEFI only:
 - **No recovery partition.** It would be unconfigured, because nothing here wires
   `reagentc`, so an option to create one would produce a partition that looks
   functional and is not. The layout has no such option.
+
+### BIOS/MBR layout
+
+Why not the ChromeOS shim chain: the RMA shim boots a signed ChromeOS kernel
+through depthcharge, so no EFI runtime exists in which `bootmgfw.efi` could
+execute, and the shim kernel has no working `kexec` to hand off with. Windows on a
+Chromebook needs firmware that supplies a PC boot environment; the supported route
+is the reversible RW_LEGACY payload (SeaBIOS), which keeps ChromeOS bootable.
+
+| Partition | Size | Type | Filesystem | Role |
+|---|---|---|---|---|
+| Boot | 512 MiB | MBR `0x0c`, active | FAT32 | `\bootmgr`, `\Boot\BCD`, `boot.sdi`, fonts |
+| Windows | remainder | MBR `0x07` | NTFS | Windows |
+
+- **Boot files live on the active partition.** The chain is MBR code -> active
+  partition -> `\bootmgr` -> `\Boot\BCD` -> `\Windows\System32\winload.exe`.
+  `bcdboot /f BIOS` writes them there; `/f UEFI` would write an ESP layout that
+  this firmware never reads.
+- **`bootsect /nt60 S: /mbr` is part of the installation.** bcdboot only places
+  files. The record that loads `\bootmgr`, and the master record that starts the
+  active partition, are written afterwards and before verification. Without them
+  the disk contains a correct Boot Manager and still does not start.
+- **One active partition, no MSR, no ESP.** MSR and the EFI system partition are
+  GPT concepts; MBR needs neither, and creating them would only mislead.
+- **2 TiB is a hard limit.** MBR cannot describe a partition beyond 32 bits of
+  512-byte sectors, so a larger disk is refused instead of partitioned into an
+  extent the firmware cannot address.
+- **No backup table**, so nothing is reserved at the end of the disk, unlike GPT.
+- **Verification differs.** `Test-WtgLegacyInstallation` requires `\bootmgr`,
+  `\Boot\BCD`, `winload.exe` and the SYSTEM hive, and deliberately does not
+  require `winload.efi`: a BIOS installation does not use it, and demanding it
+  would fail a working disk.
+
+The installer stick itself is built the same way: an MBR disk with one active
+FAT32 partition holding both `\bootmgr` and `\boot\BCD` (its volume boot record
+is the FAT32 PE variant, with the hidden-sector field patched to the real
+partition offset) and the UEFI files as well, so one medium can start on either
+firmware.
 
 ### Single-USB layout
 
@@ -213,8 +258,9 @@ gives first-boot specialization.
 
 | Layer | How it is tested | Status |
 |---|---|---|
-| `build-media.sh` | Self-test runs the real script end to end with a simulated xorriso/wimlib/mtools/sgdisk on PATH and asserts on the produced FAT contents, patched WIM, split parts, manifest, ISO, single-USB layout and the too-small-device refusal | Passing (48 checks) |
-| Classification, authorization, protection plan | 67 unit tests with synthetic disk records, including eMMC/UFS/NVMe/SATA/SD/system-disk cases | Passing |
+| `build-media.sh` | Self-test runs the real script end to end with a simulated xorriso/wimlib/mtools/sgdisk/ms-sys/sfdisk on PATH and asserts on the produced FAT contents, patched WIM, split parts, manifest, ISO, single-USB layout, BIOS/MBR structures and the refusal cases | Passing (65 checks) |
+| Classification, authorization, protection plan, layouts | 75 unit tests with synthetic disk records, including eMMC/UFS/NVMe/SATA/SD/system-disk cases and the GPT and MBR layouts | Passing |
+| A real BIOS boot on hardware | `ms-sys`, `bootsect.exe` and SeaBIOS loading `\bootmgr` | **Not run** — no Chromebook or legacy firmware here |
 | Pipeline command generation | Unit test records every executor call during a full install with an internal disk attached and fails if any command names it | Passing |
 | Real storage stack | QEMU/OVMF: internal disk as a qcow2 base + overlay; assert zero data clusters written and base hash unchanged | Not run here (needs ISO) |
 | Real installation | End-to-end on hardware | Not run here |

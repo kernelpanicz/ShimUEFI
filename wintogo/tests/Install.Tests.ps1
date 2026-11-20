@@ -432,4 +432,111 @@ Test-Case 'an install refuses to start when the target is no longer the authoriz
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
 }
 
+Test-Case 'the BIOS diskpart script builds an active boot partition and one Windows partition' {
+    $layout = New-WtgLegacyLayoutPlan -DiskSize 500GB
+    $script = New-WtgLegacyDiskpartScript -Layout $layout -DiskNumber 2
+
+    Assert-Contains $script 'select disk 2'
+    Assert-Contains $script 'clean'
+    Assert-Contains $script 'convert mbr'
+    Assert-Contains $script 'create partition primary size=512'
+    Assert-Contains $script 'format quick fs=fat32'
+    Assert-Contains $script 'active'
+    Assert-Contains $script 'format quick fs=ntfs'
+    Assert-NotContains $script 'create partition efi'
+    Assert-NotContains $script 'create partition msr'
+    Assert-NotContains $script 'convert gpt'
+    Assert-Equal 1 ([regex]::Matches($script, '(?im)^\s*select\s+disk')).Count
+
+    # The boot partition is marked active before the Windows partition is created,
+    # otherwise the MBR code has nothing to load.
+    Assert-True ($script.IndexOf('active') -lt $script.LastIndexOf('create partition primary'))
+}
+
+Test-Case 'a BIOS install asks bcdboot for BIOS files and writes the boot records' {
+    Reset-RecordedCalls
+    $null = Invoke-WtgBcdboot -WindowsDriveLetter 'W' -EspDriveLetter 'S' -Firmware 'BIOS'
+    $null = Invoke-WtgBootsect -BootDriveLetter 'S'
+
+    $bcd = $recordedCalls | Where-Object { $_.File -eq 'bcdboot.exe' }
+    Assert-Contains ($bcd.Args -join ' ') '/f BIOS'
+    Assert-Contains ($bcd.Args -join ' ') 'W:\Windows'
+    Assert-Contains ($bcd.Args -join ' ') '/s S:'
+
+    $bootsect = $recordedCalls | Where-Object { $_.File -eq 'bootsect.exe' }
+    Assert-Contains ($bootsect.Args -join ' ') '/nt60 S:'
+    Assert-Contains ($bootsect.Args -join ' ') '/mbr'
+}
+
+Test-Case 'a layout that does not match the firmware is refused before anything is written' {
+    Reset-RecordedCalls
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-mismatch-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $image = Join-Path $work 'install.wim'
+    Set-Content -LiteralPath $image -Value 'test-image'
+
+    # An MBR disk cannot be started by UEFI firmware...
+    Assert-Throws -Body {
+        Invoke-WtgInstall -Disk $external -Authorization $auth -Policy $policy -ImagePath $image -ImageIndex 1 `
+            -WorkDirectory $work -Mode Legacy -Firmware Uefi
+    } -MessagePattern 'UEFI'
+
+    # ...and BIOS firmware cannot start a GPT disk.
+    Assert-Throws -Body {
+        Invoke-WtgInstall -Disk $external -Authorization $auth -Policy $policy -ImagePath $image -ImageIndex 1 `
+            -WorkDirectory $work -Mode Fresh -Firmware Bios
+    } -MessagePattern 'BIOS'
+
+    Assert-Equal 0 $recordedCalls.Count 'no command may run for a mismatched layout'
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
+Test-Case 'a full BIOS install writes only to the selected external disk' {
+    Reset-RecordedCalls
+
+    $auth = New-TestAuthorization
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('wtg-legacy-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $image = Join-Path $work 'install.wim'
+    Set-Content -LiteralPath $image -Value 'test-image'
+
+    $volumeResolver = {
+        param($diskNumber)
+        [pscustomobject]@{
+            BootDriveLetter = 'S'; BootPartitionNumber = 1
+            EspDriveLetter = 'S'; WindowsDriveLetter = 'W'
+        }
+    }
+
+    $result = Invoke-WtgInstall -Disk $external -Authorization $auth -Policy $policy `
+        -ImagePath $image -ImageIndex 1 -WorkDirectory $work -Firmware Bios -Mode Legacy `
+        -VolumeResolver $volumeResolver
+
+    $scriptText = Get-Content -LiteralPath (Join-Path $work 'partition.txt') -Raw
+    Assert-Contains $scriptText 'convert mbr'
+    Assert-Contains $scriptText 'select disk 1'
+    Assert-NotContains $scriptText 'gpt'
+
+    $allText = ($recordedCalls | ForEach-Object { $_.Text }) -join ' || '
+    Assert-NotContains $allText 'disk 0'
+    Assert-Contains $allText 'diskpart.exe'
+    Assert-Contains $allText 'dism.exe'
+    Assert-Contains $allText 'bootsect.exe'
+
+    $bcd = $recordedCalls | Where-Object { $_.File -eq 'bcdboot.exe' }
+    Assert-Contains ($bcd.Args -join ' ') '/f BIOS'
+    $bootsect = $recordedCalls | Where-Object { $_.File -eq 'bootsect.exe' }
+    Assert-Contains ($bootsect.Args -join ' ') '/nt60 S:'
+
+    Assert-Equal 'Mbr' $result.Layout.Style
+    Assert-Equal 'Bios' $result.Firmware
+    Assert-Equal 'Legacy' $result.Mode
+
+    # The fake target has no boot files, so verification must say so.
+    Assert-False $result.Verification.Valid
+
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+}
+
 Complete-WtgTestRun 'Install.Tests'

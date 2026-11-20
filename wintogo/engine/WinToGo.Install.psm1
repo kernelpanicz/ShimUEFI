@@ -183,6 +183,53 @@ function New-WtgSingleUsbDiskpartScript {
     return ($lines -join [Environment]::NewLine) + [Environment]::NewLine
 }
 
+function New-WtgLegacyDiskpartScript {
+    <#
+    .SYNOPSIS
+        Generates the diskpart script that wipes and partitions exactly one disk
+        for BIOS firmware.
+
+    .DESCRIPTION
+        Pure function. MBR rather than GPT, because the firmware being booted is
+        BIOS: \bootmgr is loaded from the active partition and winload.exe from
+        the Windows partition. The boot partition is marked active so the master
+        boot record can find it; the boot code itself is written afterwards by
+        bootsect.
+
+        As with the GPT script, the first line selects the authorized disk number
+        and no second select ever appears.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Layout,
+        [Parameter(Mandatory = $true)][int]$DiskNumber
+    )
+
+    if (-not $Layout.Valid) {
+        throw ('WTG-INSTALL: refusing to generate a diskpart script from an invalid layout: ' + ($Layout.Errors -join '; '))
+    }
+
+    $boot = $Layout.Partitions | Where-Object { $_.Name -eq 'Boot' } | Select-Object -First 1
+    $win  = $Layout.Partitions | Where-Object { $_.Name -eq 'Windows' } | Select-Object -First 1
+    if ($null -eq $boot -or $null -eq $win) {
+        throw 'WTG-INSTALL: layout is missing the boot or Windows partition'
+    }
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $lines.Add('rem ShimUEFI portable Windows - generated BIOS partition script')
+    $lines.Add('rem This script addresses one disk only.')
+    $lines.Add(('select disk {0}' -f $DiskNumber))
+    $lines.Add('clean')
+    $lines.Add('convert mbr')
+    $lines.Add(('create partition primary size={0}' -f $boot.SizeMB))
+    $lines.Add('format quick fs=fat32 label="SYSTEM"')
+    $lines.Add('active')
+    $lines.Add('create partition primary')
+    $lines.Add('format quick fs=ntfs label="WINDOWS"')
+    $lines.Add('exit')
+
+    return ($lines -join [Environment]::NewLine) + [Environment]::NewLine
+}
+
 # GPT partition types that matter when a single-USB medium formats its own
 # Windows partition. Anything that is not Microsoft basic data is refused.
 $script:GptTypeBasicData = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
@@ -307,7 +354,7 @@ function Invoke-WtgPartition {
         [Parameter(Mandatory = $true)]$Policy,
         $Layout = $null,
         [Parameter(Mandatory = $true)][string]$WorkDirectory,
-        [ValidateSet('Fresh', 'SingleUsb')][string]$Mode = 'Fresh',
+        [ValidateSet('Fresh', 'SingleUsb', 'Legacy')][string]$Mode = 'Fresh',
         [int]$WindowsPartitionNumber = 3,
         # Seam for tests: reads the target's partition table before anything is
         # formatted. Defaults to Get-Partition on the authorized disk.
@@ -352,11 +399,16 @@ function Invoke-WtgPartition {
     }
 
     $scriptPath = Join-Path $WorkDirectory 'partition.txt'
-    if ($Mode -eq 'SingleUsb') {
-        $scriptText = New-WtgSingleUsbDiskpartScript -DiskNumber $Authorization.DiskNumber -WindowsPartitionNumber $WindowsPartitionNumber
-    }
-    else {
-        $scriptText = New-WtgDiskpartScript -Layout $Layout -DiskNumber $Authorization.DiskNumber
+    switch ($Mode) {
+        'SingleUsb' {
+            $scriptText = New-WtgSingleUsbDiskpartScript -DiskNumber $Authorization.DiskNumber -WindowsPartitionNumber $WindowsPartitionNumber
+        }
+        'Legacy' {
+            $scriptText = New-WtgLegacyDiskpartScript -Layout $Layout -DiskNumber $Authorization.DiskNumber
+        }
+        default {
+            $scriptText = New-WtgDiskpartScript -Layout $Layout -DiskNumber $Authorization.DiskNumber
+        }
     }
     Set-Content -LiteralPath $scriptPath -Value $scriptText -Encoding ASCII
 
@@ -410,6 +462,67 @@ function Get-WtgTargetVolumes {
         WindowsPartitionNumber = $windows.PartitionNumber
         WindowsDriveLetter = $winLetter
         WindowsSizeBytes   = [long]$windows.Size
+    }
+}
+
+function Get-WtgLegacyVolumes {
+    <#
+    .SYNOPSIS
+        Finds the active boot partition and the Windows partition of an
+        MBR-partitioned target.
+
+    .DESCRIPTION
+        MBR has no partition type GUID to match, so the boot partition is
+        identified by the active flag (or a FAT filesystem) and Windows by being
+        the largest NTFS partition on the same disk. Both are matched by disk
+        number, never by drive letter, so a leftover letter on another disk cannot
+        be mistaken for the target.
+
+    .OUTPUTS
+        The same shape as Get-WtgTargetVolumes; BootDriveLetter duplicates
+        EspDriveLetter so the rest of the pipeline does not branch on firmware.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber
+    )
+
+    $partitions = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction Stop)
+
+    $boot = $partitions | Where-Object {
+        $isActive = [bool](Get-WtgProp $_ 'IsActive' $false)
+        $isActive -or ([string](Get-WtgProp $_ 'Type' '') -match 'FAT')
+    } | Select-Object -First 1
+
+    $windows = $partitions | Where-Object {
+        [string](Get-WtgProp $_ 'Type' '') -match 'NTFS|IFS'
+    } | Sort-Object Size -Descending | Select-Object -First 1
+
+    if ($null -eq $boot)    { throw ('WTG-INSTALL: no active FAT boot partition found on disk {0}' -f $DiskNumber) }
+    if ($null -eq $windows) { throw ('WTG-INSTALL: no NTFS Windows partition found on disk {0}' -f $DiskNumber) }
+    if ($boot.PartitionNumber -eq $windows.PartitionNumber) {
+        throw ('WTG-INSTALL: the boot partition and the Windows partition are the same partition on disk {0}; refusing' -f $DiskNumber)
+    }
+
+    $bootLetter = [string]$boot.DriveLetter
+    if (-not $bootLetter) {
+        Set-Partition -DiskNumber $DiskNumber -PartitionNumber $boot.PartitionNumber -NewDriveLetter 'S' -ErrorAction Stop
+        $bootLetter = 'S'
+    }
+
+    $winLetter = [string]$windows.DriveLetter
+    if (-not $winLetter) {
+        Set-Partition -DiskNumber $DiskNumber -PartitionNumber $windows.PartitionNumber -NewDriveLetter 'W' -ErrorAction Stop
+        $winLetter = 'W'
+    }
+
+    return [pscustomobject]@{
+        BootPartitionNumber    = $boot.PartitionNumber
+        BootDriveLetter        = $bootLetter
+        EspPartitionNumber     = $boot.PartitionNumber
+        EspDriveLetter         = $bootLetter
+        WindowsPartitionNumber = $windows.PartitionNumber
+        WindowsDriveLetter     = $winLetter
+        WindowsSizeBytes       = [long]$windows.Size
     }
 }
 
@@ -521,13 +634,43 @@ function Invoke-WtgBcdboot {
     param(
         [Parameter(Mandatory = $true)][string]$WindowsDriveLetter,
         [Parameter(Mandatory = $true)][string]$EspDriveLetter,
+        [ValidateSet('UEFI', 'BIOS')][string]$Firmware = 'UEFI',
         [string]$Locale = 'en-us',
         [string]$JournalPath
     )
 
+    # /f decides which boot files are written: EFI\Microsoft\Boot\bootmgfw.efi for
+    # UEFI, or \bootmgr plus \Boot\BCD on the active partition for BIOS.
     Invoke-WtgExternal -FilePath 'bcdboot.exe' -Arguments @(
-        ($WindowsDriveLetter + ':\Windows'), '/s', ($EspDriveLetter + ':'), '/f', 'UEFI', '/l', $Locale
-    ) -JournalPath $JournalPath -Description 'install windows boot manager on target esp' | Out-Null
+        ($WindowsDriveLetter + ':\Windows'), '/s', ($EspDriveLetter + ':'), '/f', $Firmware, '/l', $Locale
+    ) -JournalPath $JournalPath -Description 'install windows boot manager on the target boot partition' | Out-Null
+    return $true
+}
+
+function Invoke-WtgBootsect {
+    <#
+    .SYNOPSIS
+        Writes the Windows master boot record and volume boot record.
+
+    .DESCRIPTION
+        bcdboot only places files. On BIOS firmware the code that loads them must
+        exist as well: bootsect /nt60 writes the volume boot record that loads
+        \bootmgr, and /mbr writes the master boot record that starts the active
+        partition. Without both, a disk can contain a perfectly correct Boot
+        Manager and still not start.
+
+        Only ever called on a disk that is already authorized and partitioned, and
+        it only names the boot partition of that disk.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$BootDriveLetter,
+        [string]$Executable = 'bootsect.exe',
+        [string]$JournalPath
+    )
+
+    Invoke-WtgExternal -FilePath $Executable -Arguments @(
+        '/nt60', ($BootDriveLetter + ':'), '/mbr', '/force'
+    ) -JournalPath $JournalPath -Description 'write windows boot code to the target disk' | Out-Null
     return $true
 }
 
@@ -737,6 +880,49 @@ function Test-WtgInstallation {
     }
 }
 
+function Test-WtgLegacyInstallation {
+    <#
+    .SYNOPSIS
+        Checks that a completed BIOS installation has the files needed to boot.
+
+    .DESCRIPTION
+        Read-only. The BIOS chain is \bootmgr and \Boot\BCD on the active
+        partition, then \Windows\System32\winload.exe inside the image.
+        winload.efi is deliberately not required: a BIOS installation does not use
+        it, and requiring it here would fail a working disk.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$BootDriveLetter,
+        [Parameter(Mandatory = $true)][string]$WindowsDriveLetter
+    )
+
+    $required = @(
+        @{ Path = ($BootDriveLetter + ':\bootmgr');                           Description = 'Windows Boot Manager on the active partition' },
+        @{ Path = ($BootDriveLetter + ':\Boot\BCD');                          Description = 'BCD store on the active partition' },
+        @{ Path = ($WindowsDriveLetter + ':\Windows\System32\winload.exe');    Description = 'Windows BIOS loader' },
+        @{ Path = ($WindowsDriveLetter + ':\Windows\System32\config\SYSTEM');  Description = 'Windows SYSTEM hive' }
+    )
+
+    $checks = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($item in $required) {
+        $exists = Test-Path -LiteralPath $item.Path -ErrorAction SilentlyContinue
+        $checks.Add([pscustomobject]@{
+            Path        = $item.Path
+            Description = $item.Description
+            Present     = [bool]$exists
+        })
+    }
+
+    $missing = @($checks | Where-Object { -not $_.Present })
+
+    return [pscustomobject]@{
+        Valid          = ($missing.Count -eq 0)
+        Checks         = $checks.ToArray()
+        Missing        = @($missing | ForEach-Object { $_.Path })
+        FallbackLoader = $false
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -760,8 +946,12 @@ function Invoke-WtgInstall {
         [string]$DriverDirectory,
         [string]$JournalPath,
         [string]$OperatingSystemLocale = 'en-us',
-        [ValidateSet('Fresh', 'SingleUsb')][string]$Mode = 'Fresh',
+        [ValidateSet('Uefi', 'Bios')][string]$Firmware = 'Uefi',
+        [ValidateSet('Fresh', 'SingleUsb', 'Legacy')][string]$Mode = 'Fresh',
         [int]$WindowsPartitionNumber = 3,
+        # bootsect.exe is on PATH in WinPE; a medium built from an ISO also
+        # carries a copy at \boot\bootsect.exe for images that lack it.
+        [string]$BootsectPath = 'bootsect.exe',
         # Seam for tests: see Invoke-WtgPartition.
         [scriptblock]$PartitionProvider = $null,
         [scriptblock]$OnProgress,
@@ -786,6 +976,16 @@ function Invoke-WtgInstall {
         throw ('WTG-INSTALL: split image set not found: ' + $SwmPath)
     }
 
+    # The partition style has to match the firmware that will start the disk.
+    # Getting this wrong produces a complete installation that cannot boot, so it
+    # is refused here rather than discovered after an hour of copying.
+    if ($Mode -eq 'Legacy' -and $Firmware -ne 'Bios') {
+        throw 'WTG-INSTALL: an MBR/BIOS installation cannot be started by UEFI firmware; refusing'
+    }
+    if ($Mode -ne 'Legacy' -and $Firmware -eq 'Bios') {
+        throw ('WTG-INSTALL: this firmware is BIOS, so a {0} layout could not be started from it; refusing' -f $Mode)
+    }
+
     # ---- stage 2: plan the layout -------------------------------------------
     & $report 'layout' 6 'Planning the partition layout'
     if ($Mode -eq 'SingleUsb') {
@@ -795,6 +995,12 @@ function Invoke-WtgInstall {
             throw ('WTG-INSTALL: this device is smaller than the {0:N0} GB minimum for Windows' -f ($Policy.MinimumTargetBytes / 1GB))
         }
         $layout = $null
+    }
+    elseif ($Mode -eq 'Legacy') {
+        $layout = New-WtgLegacyLayoutPlan -DiskSize ([long]$Disk.Size)
+        if (-not $layout.Valid) {
+            throw ('WTG-INSTALL: the target disk cannot take an MBR layout: ' + ($layout.Errors -join '; '))
+        }
     }
     else {
         $layout = New-WtgLayoutPlan -DiskSize ([long]$Disk.Size)
@@ -840,7 +1046,12 @@ function Invoke-WtgInstall {
 
     & $report 'partition' 20 'Waiting for the new volumes'
     if ($null -eq $VolumeResolver) {
-        $VolumeResolver = { param($diskNumber) Get-WtgTargetVolumes -DiskNumber $diskNumber }
+        if ($Mode -eq 'Legacy') {
+            $VolumeResolver = { param($diskNumber) Get-WtgLegacyVolumes -DiskNumber $diskNumber }
+        }
+        else {
+            $VolumeResolver = { param($diskNumber) Get-WtgTargetVolumes -DiskNumber $diskNumber }
+        }
     }
 
     $volumes = $null
@@ -869,17 +1080,32 @@ function Invoke-WtgInstall {
     }
 
     # ---- stage 5: boot manager ----------------------------------------------
-    & $report 'boot' 80 'Writing Windows Boot Manager to the target ESP'
-    Invoke-WtgBcdboot -WindowsDriveLetter $volumes.WindowsDriveLetter `
-        -EspDriveLetter $volumes.EspDriveLetter -Locale $OperatingSystemLocale -JournalPath $JournalPath | Out-Null
+    if ($Mode -eq 'Legacy') {
+        & $report 'boot' 80 'Writing Windows Boot Manager to the active partition'
+        Invoke-WtgBcdboot -WindowsDriveLetter $volumes.WindowsDriveLetter `
+            -EspDriveLetter $volumes.BootDriveLetter -Firmware 'BIOS' `
+            -Locale $OperatingSystemLocale -JournalPath $JournalPath | Out-Null
 
-    # bcdboot may leave \EFI\Boot\BOOTX64.EFI absent; without it many firmware boot
-    # menus cannot find the disk at all, so it is placed explicitly.
-    if (-not (Confirm-WtgFallbackLoader -EspDriveLetter $volumes.EspDriveLetter -JournalPath $JournalPath)) {
-        # Deliberately not fatal here. Test-WtgInstallation is the single place
-        # that decides whether the target can boot, and it requires this file, so
-        # a failed copy surfaces there instead of as a second, weaker verdict.
-        & $report 'boot' 82 'could not place the EFI fallback loader; verification will report it'
+        # Files alone are not a bootable disk: the MBR and volume boot record
+        # that lead the firmware to \bootmgr are written here.
+        & $report 'boot' 83 'Writing the master and volume boot records'
+        Invoke-WtgBootsect -BootDriveLetter $volumes.BootDriveLetter `
+            -Executable $BootsectPath -JournalPath $JournalPath | Out-Null
+    }
+    else {
+        & $report 'boot' 80 'Writing Windows Boot Manager to the target ESP'
+        Invoke-WtgBcdboot -WindowsDriveLetter $volumes.WindowsDriveLetter `
+            -EspDriveLetter $volumes.EspDriveLetter -Firmware 'UEFI' `
+            -Locale $OperatingSystemLocale -JournalPath $JournalPath | Out-Null
+
+        # bcdboot may leave \EFI\Boot\BOOTX64.EFI absent; without it many firmware
+        # boot menus cannot find the disk at all, so it is placed explicitly.
+        if (-not (Confirm-WtgFallbackLoader -EspDriveLetter $volumes.EspDriveLetter -JournalPath $JournalPath)) {
+            # Deliberately not fatal here. Test-WtgInstallation is the single place
+            # that decides whether the target can boot, and it requires this file,
+            # so a failed copy surfaces there instead of as a weaker second verdict.
+            & $report 'boot' 82 'could not place the EFI fallback loader; verification will report it'
+        }
     }
 
     # ---- stage 6: portable settings -----------------------------------------
@@ -888,8 +1114,14 @@ function Invoke-WtgInstall {
 
     # ---- stage 7: verify ----------------------------------------------------
     & $report 'verify' 95 'Verifying boot files on the target'
-    $verification = Test-WtgInstallation -EspDriveLetter $volumes.EspDriveLetter `
-        -WindowsDriveLetter $volumes.WindowsDriveLetter
+    if ($Mode -eq 'Legacy') {
+        $verification = Test-WtgLegacyInstallation -BootDriveLetter $volumes.BootDriveLetter `
+            -WindowsDriveLetter $volumes.WindowsDriveLetter
+    }
+    else {
+        $verification = Test-WtgInstallation -EspDriveLetter $volumes.EspDriveLetter `
+            -WindowsDriveLetter $volumes.WindowsDriveLetter
+    }
 
     # Copy the installer log onto the target so it survives a reboot.
     if ($JournalPath -and (Test-Path -LiteralPath $JournalPath)) {
@@ -909,6 +1141,8 @@ function Invoke-WtgInstall {
         EspDriveLetter     = $volumes.EspDriveLetter
         WindowsDriveLetter = $volumes.WindowsDriveLetter
         Layout             = $layout
+        Firmware           = $Firmware
+        Mode               = $Mode
         DiskNumber         = $Authorization.DiskNumber
         SerialNumber       = $Authorization.SerialNumber
     }
@@ -920,18 +1154,22 @@ Export-ModuleMember -Function @(
     'Invoke-WtgExternal',
     'New-WtgDiskpartScript',
     'New-WtgSingleUsbDiskpartScript',
+    'New-WtgLegacyDiskpartScript',
     'Get-WtgGptTypeLabel',
     'Assert-WtgSingleUsbWindowsPartition',
     'Invoke-WtgPartition',
     'Get-WtgTargetVolumes',
+    'Get-WtgLegacyVolumes',
     'ConvertFrom-WtgWimInfo',
     'Get-WtgImageEditions',
     'Invoke-WtgApplyImage',
     'Invoke-WtgAddDrivers',
     'Invoke-WtgBcdboot',
+    'Invoke-WtgBootsect',
     'Confirm-WtgFallbackLoader',
     'New-WtgRegistryOperations',
     'Set-WtgOfflinePortableSettings',
     'Test-WtgInstallation',
+    'Test-WtgLegacyInstallation',
     'Invoke-WtgInstall'
 )

@@ -1,7 +1,8 @@
 # ShimUEFI — Portable Windows
 
-Run a **real Windows installation from a USB drive or external SSD** on any
-x86-64 UEFI computer, **without ever writing to that computer's internal disk**.
+Run a **real Windows installation from a USB drive or external SSD** on x86-64
+UEFI computers — and, with legacy BIOS firmware, on Chromebooks — **without ever
+writing to that computer's internal disk**.
 
 Nothing is repartitioned, formatted or mounted inside the machine. Unplug the
 drive and the computer is exactly as it was. This is not a Linux desktop dressed
@@ -23,7 +24,8 @@ Microsoft files are stored in this repository.
 - A Windows 10/11 x86-64 installation ISO (WIM or ESD).
 - An empty USB stick (≥2 GB) for the installer, and an external disk (≥32 GB,
   64 GB+ recommended) for Windows.
-- A computer that boots UEFI x86-64. Legacy BIOS/CSM is not supported.
+- A computer that boots x86-64 UEFI, or legacy BIOS with `--boot-mode bios`
+  (see [Chromebooks](#chromebooks-legacy-bios--rw_legacy)).
 
 ```bash
 sudo apt install xorriso wimtools mtools dosfstools gdisk
@@ -119,6 +121,7 @@ Details and trade-offs: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `--allow-internal-bus-override` | Offer NVMe/SATA enclosures (serial still required) |
 | `--single-usb --disk-size SIZE` | One device as installer and target |
 | `--min-device-size SIZE` | Smallest device allowed, default `32G` (matches the installer policy) |
+| `--boot-mode uefi\|bios` | `uefi` (default): GPT + `bootmgfw.efi`. `bios`: MBR + `\bootmgr` for legacy firmware |
 | `--min-windows-size SIZE` | Room Windows must be left with, default `25G` |
 | `--unattended-disk N --unattended-serial S` | Pre-fill the target; the serial is still verified |
 | `--unattended-index N` | Pre-select a Windows edition |
@@ -136,7 +139,9 @@ the firmware can see. Internal storage of any kind is simply never used.
 
 | Case | Result |
 |---|---|
-| Legacy BIOS / CSM, 32-bit UEFI, ARM64 | Not supported |
+| Legacy BIOS/CSM on a PC, or Chromebook with RW_LEGACY | Supported with `--boot-mode bios`; the disk is MBR |
+| ChromeOS firmware with no PC boot payload (the RMA shim) | Cannot run Windows: see [Chromebooks](#chromebooks-legacy-bios--rw_legacy) |
+| 32-bit UEFI, ARM64 | Not supported |
 | Thunderbolt/USB4 NVMe and SATA docks | Reported as NVMe/SATA, so blocked unless built with `--allow-internal-bus-override` |
 | SD cards | Blocked unless built with `--allow-sd-card`; eMMC is always internal |
 | Intel RST/VMD-only machines | Needs the vendor driver via `--driver-dir` |
@@ -145,10 +150,47 @@ the firmware can see. Internal storage of any kind is simply never used.
 No universal compatibility is claimed: portability depends on the firmware, the
 controller and Secure Boot policy of each machine.
 
+## Chromebooks (legacy BIOS / RW_LEGACY)
+
+Windows cannot start through the ChromeOS RMA shim. The shim boots a signed
+ChromeOS kernel through depthcharge, so there is no EFI runtime for
+`bootmgfw.efi` to run in, and the shim kernel has no working `kexec`. Windows on
+a Chromebook therefore needs firmware that provides a PC boot environment. The
+smallest such change is the **reversible RW_LEGACY payload** (SeaBIOS), which
+leaves ChromeOS bootable:
+
+1. Install RW_LEGACY firmware for your exact board with the MrChromebox firmware
+   utility. This is a firmware change made outside this project; a failed write
+   can brick the device.
+2. Build the BIOS medium:
+
+   ```bash
+   sudo ./wintogo/build/build-media.sh --iso /path/to/windows.iso --boot-mode bios
+   ```
+
+3. `dd` `out/shimuefi-installer-bios.img` to the installer stick, boot the
+   Chromebook, press **Ctrl+L** at the developer-mode screen to enter SeaBIOS, and
+   pick the stick.
+4. Install onto a second external disk as usual. The target becomes MBR with
+   `\bootmgr` and `\Boot\BCD` on its active partition: the genuine Windows Boot
+   Manager in BIOS mode, started by the firmware's own boot code.
+5. To start Windows later, Ctrl+L again and pick the disk. Without it, ChromeOS
+   starts normally.
+
+`--boot-mode bios` and `--single-usb` are refused together: a single-USB medium
+is GPT and BIOS firmware cannot start it. The build stops before writing
+anything.
+
+**Expect a rough ride on hardware.** RW_LEGACY is documented as Linux-only by
+[chrultrabook](https://docs.chrultrabook.com/docs/faq.html); this project makes
+the Windows boot chain correct, but Chromebook audio, touchpad and power
+management have no Windows drivers without the full UEFI ROM and per-board
+driver work.
+
 ## Testing
 
 ```powershell
-# 67 unit tests; no hardware, no Windows image needed
+# 75 unit tests; no hardware, no Windows image needed
 powershell -NoProfile -ExecutionPolicy Bypass -File wintogo/tests/run-tests.ps1
 ```
 
@@ -177,14 +219,19 @@ zero data clusters and the base image is byte-identical.
 
 ### What has actually been verified
 
-- ✅ `build-media.sh` runs end to end against a simulated toolchain (49 checks).
-- ✅ 67 unit tests pass on Windows PowerShell 5.1, the version WinPE ships.
+- ✅ `build-media.sh` runs end to end against a simulated toolchain (65 checks),
+  including the BIOS/MBR image: 0x55AA signature, active FAT32 partition, the
+  volume boot record at the 1 MiB offset, and `\bootmgr` + `\Boot\BCD` staged.
+- ✅ 75 unit tests pass on Windows PowerShell 5.1, the version WinPE ships.
 - ✅ The classifier was run against real hardware and flagged the internal NVMe
   system disk as internal, refusing to build a target list from it.
 - ❌ The real toolchain (`xorriso`, `wimlib`, `mtools`, `sgdisk`) has not been
   exercised here — the self-test substitutes it.
 - ❌ No end-to-end Windows installation has been run, and the QEMU protection
   test has not been run, because both need a Windows ISO and QEMU/OVMF.
+- ❌ The BIOS path has not been run on hardware: `ms-sys`, `bootsect.exe`, and
+  SeaBIOS starting `\bootmgr` from a real disk are all unexercised here. The
+  self-test proves the image structure, not that a Chromebook boots it.
 - ❌ Not booted on more than one physical machine.
 
 Everything invoked is a documented Microsoft procedure; the tests cover the
@@ -192,6 +239,12 @@ logic that decides *which disk*. Treat the pipeline as unproven on your hardware
 until you have run the QEMU test and one real installation.
 
 ## Limitations
+
+- **BIOS installs are unproven on real hardware** (see above), and RW_LEGACY
+  firmware is Linux-only by its own documentation. The boot chain is correct; the
+  machine may still lack drivers for sound, touchpad and power.
+- **MBR stops at 2 TiB.** A larger disk is refused in BIOS mode rather than
+  partitioned into something the firmware cannot address.
 
 - **No WinRE**: no recovery partition is created, because nothing here wires one
   into `reagentc`.

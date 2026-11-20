@@ -66,7 +66,7 @@ assert_absent() {
 # ---------------------------------------------------------------------------
 
 chmod +x "$stub_lib"
-for tool in xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir sgdisk; do
+for tool in xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir sgdisk ms-sys sfdisk; do
     cat > "$stub_dir/$tool" <<EOF
 #!/usr/bin/env bash
 exec "$stub_lib" "$tool" "\$@"
@@ -79,7 +79,7 @@ export FAKE_ISO="$fake_iso"
 export PATH="$stub_dir:$PATH"
 
 # Prove the stubs are what will be found, not something real on this machine.
-for tool in xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir sgdisk; do
+for tool in xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir sgdisk ms-sys sfdisk; do
     resolved="$(command -v "$tool")"
     if [ "$resolved" != "$stub_dir/$tool" ]; then
         echo "PATH shadowing failed for $tool (found $resolved)" >&2
@@ -100,6 +100,15 @@ printf 'stub-bcd' > "$fake_iso/EFI/Microsoft/Boot/BCD"
 printf 'stub-bootmgfw' > "$fake_iso/EFI/Microsoft/Boot/bootmgfw.efi"
 printf 'stub-font' > "$fake_iso/EFI/Microsoft/Boot/fonts/chs_boot.ttf"
 
+# The BIOS half of a Windows ISO: \bootmgr at the root plus \boot\BCD,
+# boot.sdi, fonts and bootsect.exe.
+mkdir -p "$fake_iso/boot/fonts"
+printf 'stub-bootmgr' > "$fake_iso/bootmgr"
+printf 'stub-bios-bcd' > "$fake_iso/boot/BCD"
+printf 'stub-sdi' > "$fake_iso/boot/boot.sdi"
+printf 'stub-bios-font' > "$fake_iso/boot/fonts/wgl4_boot.ttf"
+printf 'stub-bootsect' > "$fake_iso/boot/bootsect.exe"
+
 mkdir -p "$temp_root/drivers"
 printf '[Version]\nSignature="$WINDOWS NT$"\n' > "$temp_root/drivers/stub.inf"
 
@@ -107,7 +116,7 @@ run_build() {
     local out_dir="$1"
     shift
     # Each run starts from a clean simulated device state.
-    rm -rf "$state_dir/fat" "$state_dir/wim" "$state_dir/sgdisk"
+    rm -rf "$state_dir/fat" "$state_dir/wim" "$state_dir/sgdisk" "$state_dir/sfdisk"
     bash "$build_script" --iso "$fake_iso/win.iso-ignored" --out "$out_dir" "$@" > "$temp_root/last-run.log" 2>&1
     return $?
 }
@@ -286,6 +295,70 @@ else
 fi
 assert_contains "$temp_root/bad5.log" 'at least 25600 MiB' 'the refusal states how much room Windows needs'
 assert_absent "$temp_root/out8/shimuefi-single-usb.img" 'no image is produced for the oversized-ESP case'
+
+# ---------------------------------------------------------------------------
+printf '\n== scenario 5: BIOS (MBR) medium for legacy firmware\n'
+# ---------------------------------------------------------------------------
+
+out9="$temp_root/out9"
+if run_build "$out9" --work "$temp_root/work9" --boot-mode bios --esp-size-mb 64; then
+    pass 'build-media.sh built a BIOS medium'
+else
+    fail 'build-media.sh failed for --boot-mode bios'
+    sed 's/^/       /' "$temp_root/last-run.log" | tail -20
+fi
+
+bios_image="$out9/shimuefi-installer-bios.img"
+assert_file "$bios_image" 'the BIOS disk image was produced'
+assert_absent "$out9/shimuefi-installer.img" 'the UEFI image is not produced in BIOS mode'
+
+if [ "$(dd if="$bios_image" bs=1 skip=510 count=2 status=none | od -An -tx1 | tr -d ' \n')" = "55aa" ]; then
+    pass 'the BIOS image carries the 0x55AA master boot record signature'
+else
+    fail 'the BIOS image has no 0x55AA master boot record signature'
+fi
+
+if [ "$(dd if="$bios_image" bs=1 skip=446 count=1 status=none | od -An -tx1 | tr -d ' \n')" = "80" ]; then
+    pass 'the FAT partition is marked active'
+else
+    fail 'the FAT partition is not marked active'
+fi
+
+if [ "$(dd if="$bios_image" bs=1 skip=450 count=1 status=none | od -An -tx1 | tr -d ' \n')" = "0c" ]; then
+    pass 'the partition is FAT32 LBA'
+else
+    fail 'the partition type is not FAT32 LBA'
+fi
+
+if [ "$(dd if="$bios_image" bs=1 skip=$((1024 * 1024)) count=7 status=none)" = "MS-SYS-" ]; then
+    pass 'the FAT volume was written at the 1 MiB partition offset'
+else
+    fail 'the FAT volume is not at the 1 MiB partition offset'
+fi
+
+assert_contains "$state_dir/calls.log" 'ms-sys|-e -f' 'the FAT32 PE volume boot record is written'
+assert_contains "$state_dir/calls.log" 'ms-sys|-7 -f' 'the Windows master boot record is written'
+assert_contains "$state_dir/sfdisk/shimuefi-installer-bios.img.args" 'bootable' 'the partition is marked bootable in the table'
+assert_file "$state_dir/fat/shimuefi-esp.img.d/bootmgr" 'bootmgr is on the medium'
+assert_file "$state_dir/fat/shimuefi-esp.img.d/boot/BCD" 'the BIOS BCD is on the medium'
+
+# A GPT single-USB device cannot be started by BIOS firmware, and an El Torito ISO
+# cannot be booted by it either: both are refused at build time.
+if bash "$build_script" --iso "$fake_iso/win.iso-ignored" --out "$temp_root/out10" \
+        --boot-mode bios --single-usb --disk-size 64G > "$temp_root/bad6.log" 2>&1; then
+    fail 'a single-USB GPT device was accepted in BIOS mode'
+else
+    pass 'BIOS mode refuses a single-USB GPT device'
+fi
+assert_contains "$temp_root/bad6.log" 'GPT' 'the refusal explains the partition-style mismatch'
+
+if bash "$build_script" --iso "$fake_iso/win.iso-ignored" --out "$temp_root/out11" \
+        --boot-mode bios --iso-image > "$temp_root/bad7.log" 2>&1; then
+    fail 'an El Torito ISO was accepted in BIOS mode'
+else
+    pass 'BIOS mode refuses --iso-image'
+fi
+assert_contains "$temp_root/bad7.log" 'El Torito' 'the refusal explains why no ISO is built'
 
 # ---------------------------------------------------------------------------
 printf '\n== summary ==\n'

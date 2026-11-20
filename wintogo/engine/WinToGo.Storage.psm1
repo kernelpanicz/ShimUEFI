@@ -363,6 +363,42 @@ function Test-WtgTargetEligible {
     }
 }
 
+function Get-WtgFirmwareMode {
+    <#
+    .SYNOPSIS
+        Reports the firmware the installer is running on: Uefi, Bios or Unknown.
+
+    .DESCRIPTION
+        Read-only, and deliberately fail-closed: an unknown firmware is not
+        treated as either. The partition style that can boot this machine depends
+        on the answer, so a guess would produce a disk that does not start.
+
+        Win32_ComputerSystem.FirmwareType is the documented source (1 = BIOS,
+        2 = UEFI). WinPE also exports firmware_type in the environment, which is
+        used as a fallback for builds where the CIM property is absent.
+    #>
+    param()
+
+    try {
+        $system = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        $property = $system.PSObject.Properties['FirmwareType']
+        if ($null -ne $property -and $null -ne $property.Value) {
+            switch ([int]$property.Value) {
+                1 { return 'Bios' }
+                2 { return 'Uefi' }
+            }
+        }
+    }
+    catch { }
+
+    switch ([string]$env:firmware_type) {
+        'BIOS' { return 'Bios' }
+        'UEFI' { return 'Uefi' }
+    }
+
+    return 'Unknown'
+}
+
 function Get-WtgHardwareReport {
     <#
     .SYNOPSIS
@@ -397,7 +433,7 @@ function Get-WtgHardwareReport {
     catch { }
 
     try {
-        $report.Firmware = if ($env:firmware_type) { [string]$env:firmware_type } else { 'unknown' }
+        $report.Firmware = (Get-WtgFirmwareMode)
         if (Get-Command Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) {
             $report.SecureBoot = [string](Confirm-SecureBootUEFI)
         }
@@ -442,6 +478,7 @@ Export-ModuleMember -Function @(
     'Get-WtgDiskClassify',
     'Test-WtgSerialMatch',
     'Test-WtgTargetEligible',
+    'Get-WtgFirmwareMode',
     'Get-WtgHardwareReport',
     'Format-WtgDiskSummary'
 )

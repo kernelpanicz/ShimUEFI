@@ -28,7 +28,7 @@ shift
 state="${STUB_STATE:?STUB_STATE must be set}"
 fake_iso="${FAKE_ISO:?FAKE_ISO must be set}"
 
-mkdir -p "$state/fat" "$state/wim" "$state/sgdisk"
+mkdir -p "$state/fat" "$state/wim" "$state/sgdisk" "$state/sfdisk"
 printf '%s|%s\n' "$tool" "$*" >> "$state/calls.log"
 
 fat_root() {
@@ -44,13 +44,16 @@ xorriso)
     if printf '%s\n' "$*" | grep -q -- ' -find '; then
         wanted=""
         previous=""
+        start_path="/"
         for argument in "$@"; do
+            [ "$previous" = "-find" ] && start_path="$argument"
             [ "$previous" = "-name" ] && wanted="$argument"
             previous="$argument"
         done
         [ -n "$wanted" ] || exit 0
         # Directories match too (the fonts directory is fetched this way).
-        hit="$(cd "$fake_iso" && find . -name "$wanted" 2>/dev/null | head -n1 | sed 's|^\.||')"
+        start_path="${start_path%/}"
+        hit="$(cd "$fake_iso" && find ".$start_path" -name "$wanted" 2>/dev/null | head -n1 | sed 's|^\.||')"
         [ -n "$hit" ] && printf '%s\n' "$hit"
         exit 0
     fi
@@ -212,6 +215,30 @@ mmd|mcopy|mdir)
             fi
             ;;
     esac
+    ;;
+
+# ---------------------------------------------------------------------------
+ms-sys)
+    # Writes Microsoft boot code; the record itself is opaque to the script, which
+    # only cares that it was asked for. A marker at offset 0 lets the test prove
+    # the volume boot record travelled into the disk image with the FAT volume.
+    image="${!#}"
+    [ -f "$image" ] || { echo "stub ms-sys: no image: $image" >&2; exit 2; }
+    printf 'MS-SYS-CODE' | dd of="$image" bs=1 seek=0 conv=notrunc status=none
+    exit 0
+    ;;
+
+# ---------------------------------------------------------------------------
+sfdisk)
+    # Real sfdisk writes the partition table and leaves existing boot code alone.
+    # This stub writes the same bytes build-media.sh verifies afterwards.
+    image="${!#}"
+    [ -f "$image" ] || { echo "stub sfdisk: no image: $image" >&2; exit 2; }
+    cat > "$state/sfdisk/$(basename "$image").args"
+    printf '\x80' | dd of="$image" bs=1 seek=446 conv=notrunc status=none
+    printf '\x0c' | dd of="$image" bs=1 seek=450 conv=notrunc status=none
+    printf '\x55\xaa' | dd of="$image" bs=1 seek=510 conv=notrunc status=none
+    exit 0
     ;;
 
 # ---------------------------------------------------------------------------

@@ -4,15 +4,18 @@
 #
 # Takes a Windows installation ISO that you obtained yourself and produces:
 #
-#   out/shimuefi-installer.img   a bootable UEFI disk image (write to USB with dd)
-#   out/shimuefi-installer.iso   an ISO 9660 + El Torito UEFI image (optional)
-#   out/manifest.txt             checksums and contents
+#   out/shimuefi-installer.img       a bootable UEFI disk image (dd to USB)
+#   out/shimuefi-installer-bios.img  a BIOS/MBR disk image for legacy firmware
+#                                    such as a Chromebook running RW_LEGACY
+#   out/shimuefi-installer.iso       an ISO 9660 + El Torito UEFI image (optional)
+#   out/manifest.txt                 checksums and contents
 #
 # No Microsoft files are stored in this repository. Everything is copied out of
 # the ISO you supply, at build time, on your machine.
 #
 # Requires (Debian/Ubuntu):
 #   xorriso wimtools mtools dosfstools gdisk coreutils
+#   ms-sys sfdisk               (only for --boot-mode bios)
 #
 # Copyright (C) 2026 ShimUEFI contributors
 # Licensed under the GNU GPL v3. See LICENSE.
@@ -41,6 +44,7 @@ single_usb=0
 disk_size=""
 min_windows_size="25G"
 min_device_size="32G"
+boot_mode="uefi"
 keep_work=0
 
 info()  { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -58,8 +62,10 @@ Required:
 Output:
   --out DIR                Output directory (default: <repo>/out)
   --volume-name NAME       FAT label for the medium (default: WTGINSTALL)
-  --iso-image              Also build an ISO image
+  --iso-image              Also build an ISO image (UEFI only)
   --esp-size-mb N          Force the FAT32 image size in MiB (default: computed)
+  --boot-mode MODE         uefi (default, GPT + bootmgfw.efi) or bios (MBR with
+                           \bootmgr on the active partition, for legacy firmware)
 
 Media contents:
   --no-split               Do not split install.wim (only if it fits in 4 GiB)
@@ -106,6 +112,7 @@ while [ $# -gt 0 ]; do
         --no-split)         split_threshold_mb=999999; shift ;;
         --split-size)       split_threshold_mb="$2"; shift 2 ;;
         --esp-size-mb)      esp_size_mb="$2"; shift 2 ;;
+        --boot-mode)        boot_mode="$2"; shift 2 ;;
         --driver-dir)       driver_dir="$2"; shift 2 ;;
         --allow-sd-card)    allow_sd_card=1; shift ;;
         --allow-internal-bus-override) allow_internal_override=1; shift ;;
@@ -148,6 +155,17 @@ if [ -n "$disk_size" ] || [ "$single_usb" -eq 1 ]; then
 fi
 if [ "$single_usb" -eq 1 ] && [ -z "$disk_size" ]; then
     die "--single-usb needs --disk-size (the exact capacity of the device, e.g. --disk-size 64023257088)"
+fi
+
+case "$boot_mode" in
+    uefi|bios) ;;
+    *) die "--boot-mode must be uefi or bios" ;;
+esac
+if [ "$boot_mode" = "bios" ] && [ "$single_usb" -eq 1 ]; then
+    die "--single-usb builds a GPT device, which BIOS firmware cannot start; build a --boot-mode uefi single-USB medium, or a two-device --boot-mode bios one"
+fi
+if [ "$boot_mode" = "bios" ] && [ "$make_iso" -eq 1 ]; then
+    die "--iso-image produces a UEFI El Torito image; a BIOS medium is a disk image written to the USB drive with dd"
 fi
 
 to_bytes() {
@@ -234,6 +252,11 @@ need_tools="xorriso wimlib-imagex mkfs.vfat mmd mcopy mdir truncate dd sha256sum
 if [ "$single_usb" -eq 1 ]; then
     need_tools="$need_tools sgdisk"
 fi
+if [ "$boot_mode" = "bios" ]; then
+    # ms-sys writes the Microsoft boot records; sfdisk writes the partition
+    # table and leaves the boot code it finds alone.
+    need_tools="$need_tools ms-sys sfdisk od"
+fi
 missing=""
 for tool in $need_tools; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
@@ -247,10 +270,13 @@ fi
 # ISO access helpers
 # ---------------------------------------------------------------------------
 
-# iso_find <name> -> prints the first matching absolute path inside the ISO, or nothing.
+# iso_find <name> [start-path] -> prints the first matching absolute path inside
+# the ISO, or nothing. Scoping the start path matters for names that exist in
+# both the UEFI and the BIOS halves of a Windows ISO (fonts, BCD).
 iso_find() {
     local name="$1"
-    xorriso -indev "$iso_path" -find / -name "$name" -exec echo 2>/dev/null \
+    local start="${2:-/}"
+    xorriso -indev "$iso_path" -find "$start" -name "$name" -exec echo 2>/dev/null \
         | sed '/^xorriso :/d' | sed '/^$/d' | head -n1
 }
 
@@ -280,6 +306,16 @@ bootmgfw_path="$(iso_find bootmgfw.efi)"
 [ -n "$bcd_path" ] || die "this ISO has no EFI boot configuration (BCD)"
 [ -n "$bootmgfw_path" ] || die "this ISO has no bootmgfw.efi; it is not UEFI bootable"
 
+if [ "$boot_mode" = "bios" ]; then
+    bios_bootmgr_path="$(iso_find bootmgr)"
+    [ -n "$bios_bootmgr_path" ] || die "this ISO has no \\bootmgr at its root; it is not BIOS bootable"
+    bios_boot_sdi="$(iso_find boot.sdi)"
+    [ -n "$bios_boot_sdi" ] || die "this ISO has no \\boot\\boot.sdi; it is not BIOS bootable"
+    bios_boot_dir="$(dirname "$bios_boot_sdi")"
+    info "BIOS loader:     $bios_bootmgr_path"
+    info "BIOS boot files: $bios_boot_dir"
+fi
+
 info "boot image:      $boot_wim_path"
 info "install image:   $install_image_path"
 info "boot manager:    $bootmgfw_path"
@@ -296,9 +332,17 @@ iso_extract "$bootmgfw_path" "$work_dir/stage/EFI/Microsoft/Boot/bootmgfw.efi"
 cp "$work_dir/stage/EFI/Microsoft/Boot/bootmgfw.efi" "$work_dir/stage/EFI/Boot/BOOTX64.EFI"
 iso_extract "$bcd_path" "$work_dir/stage/EFI/Microsoft/Boot/BCD"
 
-fonts_path="$(iso_find fonts)"
+fonts_path="$(iso_find fonts /EFI/Microsoft/Boot)"
 if [ -n "$fonts_path" ]; then
     iso_extract "$fonts_path" "$work_dir/stage/EFI/Microsoft/Boot/fonts"
+fi
+
+if [ "$boot_mode" = "bios" ]; then
+    # The BIOS chain reads \bootmgr and \boot\BCD (plus boot.sdi and fonts) from
+    # the same FAT partition, so the medium can start on either firmware.
+    iso_extract "$bios_bootmgr_path" "$work_dir/stage/bootmgr"
+    iso_extract "$bios_boot_dir" "$work_dir/stage/boot"
+    info "staged the BIOS boot chain (bootmgr + $(basename "$bios_boot_dir"))"
 fi
 
 iso_extract "$boot_wim_path" "$work_dir/stage/sources/boot.wim"
@@ -376,7 +420,7 @@ info "boot.wim image 1 architecture: ${wim_index:-unknown}"
 case "${wim_index:-}" in
     *x86_64*|*amd64*|*x86*) ;;
     "") warn "could not determine the boot image architecture; continuing" ;;
-    *) warn "boot.wim image 1 is $wim_index; this project targets x86-64 UEFI" ;;
+    *) warn "boot.wim image 1 is $wim_index; this project targets x86-64 Windows" ;;
 esac
 
 wimlib-imagex update "$work_dir/stage/sources/boot.wim" 1 \
@@ -493,6 +537,55 @@ if [ "$single_usb" -eq 1 ]; then
     rm -f "$fat_image"
 
     info "wrote $image_out ($disk_bytes bytes, ESP at 1 MiB)"
+elif [ "$boot_mode" = "bios" ]; then
+    step "building the BIOS (MBR) disk image"
+
+    image_out="$out_dir/shimuefi-installer-bios.img"
+    rm -f "$image_out"
+
+    # 1. The volume boot record that loads \bootmgr. FAT32 PE is the variant used
+    #    by Windows USB installation media.
+    ms-sys -e -f "$fat_image" >/dev/null
+
+    # 2. mkfs.vfat writes zero hidden sectors, which is only true for a volume at
+    #    LBA 0. The record has to know where its own partition starts.
+    part_start_lba=2048
+    hidden_bytes="$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+        $((part_start_lba & 255)) $(((part_start_lba >> 8) & 255)) \
+        $(((part_start_lba >> 16) & 255)) $(((part_start_lba >> 24) & 255)))"
+    printf '%b' "$hidden_bytes" | dd of="$fat_image" bs=1 seek=28 conv=notrunc status=none
+
+    fat_bytes="$(stat -c %s "$fat_image")"
+    fat_sectors=$(( fat_bytes / 512 ))
+    disk_bytes=$(( part_start_lba * 512 + fat_bytes + 1024 * 1024 ))
+    truncate -s "$disk_bytes" "$image_out"
+
+    # 3. One active FAT32 LBA partition starting at 1 MiB.
+    sfdisk --quiet --no-reread "$image_out" <<EOF
+label: dos
+label-id: 0x53484655
+start=$part_start_lba, size=$fat_sectors, type=c, bootable
+EOF
+
+    dd if="$fat_image" of="$image_out" bs=512 seek="$part_start_lba" conv=notrunc status=none
+
+    # 4. Windows 7+ master boot record: loads the active partition with LBA
+    #    addressing, so it still works past cylinder 1024.
+    ms-sys -7 -f "$image_out" >/dev/null
+    rm -f "$fat_image"
+
+    step "verifying the BIOS boot structures"
+    mbr_signature="$(dd if="$image_out" bs=1 skip=510 count=2 status=none | od -An -tx1 | tr -d ' \n')"
+    [ "$mbr_signature" = "55aa" ] || die "the built image has no 0x55AA boot signature"
+    boot_flag="$(dd if="$image_out" bs=1 skip=446 count=1 status=none | od -An -tx1 | tr -d ' \n')"
+    [ "$boot_flag" = "80" ] || die "the first partition in the built image is not marked active"
+    partition_type="$(dd if="$image_out" bs=1 skip=450 count=1 status=none | od -An -tx1 | tr -d ' \n')"
+    case "$partition_type" in
+        0b|0c|0e) ;;
+        *) die "the first partition in the built image has type 0x$partition_type, not a FAT partition" ;;
+    esac
+
+    info "wrote $image_out (MBR, active FAT32 at 1 MiB, $disk_bytes bytes)"
 else
     image_out="$out_dir/shimuefi-installer.img"
     mv -f "$fat_image" "$image_out"
@@ -543,6 +636,12 @@ manifest="$out_dir/manifest.txt"
     echo "boot image:   $boot_wim_path"
     echo "windows image: $install_image_path -> $install_image_name"
     echo "volume label: $volume_name"
+    if [ "$boot_mode" = "bios" ]; then
+        echo "boot mode:    BIOS/MBR (\\bootmgr + \\Boot\\BCD on the active partition)"
+        echo "firmware:     legacy BIOS / SeaBIOS (RW_LEGACY), not UEFI"
+    else
+        echo "boot mode:    UEFI/GPT (\\EFI\\Microsoft\\Boot\\bootmgfw.efi)"
+    fi
     if [ "$single_usb" -eq 1 ]; then
         echo "mode:         single USB ($disk_bytes bytes: ESP + MSR + Windows)"
     else
@@ -583,6 +682,22 @@ Replace /dev/sdX with the whole device, not a partition. This erases that drive.
 A single device is enough: boot it and the installer formats its own Windows
 partition in place. The image was built for exactly $disk_bytes bytes, so write
 it to a device of exactly that size or the installer will refuse to run.
+EOF
+elif [ "$boot_mode" = "bios" ]; then
+    cat <<EOF
+
+Write the image to a USB drive (Linux):
+
+  sudo dd if=$image_out of=/dev/sdX bs=4M oflag=direct status=progress conv=fsync
+
+Replace /dev/sdX with the whole device, not a partition. This erases that drive.
+
+This medium starts on BIOS/legacy firmware only. On a Chromebook that means
+RW_LEGACY firmware and Ctrl+L (SeaBIOS); it will not appear in a UEFI boot menu,
+and the disk it installs to is MBR with \\bootmgr as its Boot Manager.
+
+The medium installs Windows onto a *second* external disk. Do not write this
+image to the disk you intend to install Windows onto.
 EOF
 else
     cat <<EOF

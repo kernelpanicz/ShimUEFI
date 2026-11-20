@@ -122,6 +122,18 @@ Import-Module (Join-Path $script:EngineRoot 'WinToGo.Install.psm1') -Force
 
 $policy = New-WtgStoragePolicy -AllowSdCards:$AllowSdCard -AllowInternalBusOverride:$AllowInternalBusOverride
 
+# The partition style has to match the firmware that will start the disk. It is
+# read here, once, and everything downstream uses that answer: a GPT layout on
+# BIOS firmware, or an MBR layout on UEFI, is a disk that never boots.
+$firmwareMode = Get-WtgFirmwareMode
+if ($firmwareMode -eq 'Unknown') {
+    Write-Host ''
+    Write-Host '  The firmware type could not be determined (neither Win32_ComputerSystem' -ForegroundColor Red
+    Write-Host '  nor firmware_type reported one), so the installer cannot know whether this' -ForegroundColor Red
+    Write-Host '  disk must be GPT or MBR. Refusing rather than guessing.' -ForegroundColor Red
+    exit 1
+}
+
 # A single-USB medium carries a description of the device it was built for. Its
 # presence switches the installer into single-device mode.
 $script:SingleUsbInfo = $null
@@ -183,6 +195,10 @@ try {
     $hardware = Get-WtgHardwareReport
     Write-Note ('model       ' + $hardware.ComputerModel)
     Write-Note ('firmware    ' + $hardware.Firmware + ' / Secure Boot ' + $hardware.SecureBoot)
+    if ($firmwareMode -eq 'Bios') {
+        Write-Note 'BIOS firmware: the target disk will be MBR with Windows Boot Manager on its active partition'
+        Write-Note 'on a Chromebook this is the SeaBIOS/legacy path (Ctrl+L with RW_LEGACY firmware)'
+    }
     Write-Note ('cpu         ' + $hardware.Processor)
     Write-Note ('memory      ' + $hardware.MemoryGB + ' GB')
 }
@@ -463,10 +479,23 @@ else {
 Write-Host ('  selected: ' + $chosenEdition.Name) -ForegroundColor Green
 
 Write-Step 'Partition layout for this device'
+if ($SingleUsb -and $firmwareMode -ne 'Uefi') {
+    Exit-Fatal 'this single-USB medium is GPT and can only be started by UEFI firmware; rebuild with --boot-mode uefi on a UEFI machine, or use a two-device BIOS medium here'
+}
+
 if ($SingleUsb) {
     Write-Note 'reusing the existing EFI system partition and MSR on this device'
     Write-Note ('partition {0} becomes Windows (NTFS)' -f $script:SingleUsbCheck.WindowsPartition)
     Write-Note 'the installer image stays on the EFI partition, so a failed run can be retried'
+}
+elseif ($firmwareMode -eq 'Bios') {
+    $layout = New-WtgLegacyLayoutPlan -DiskSize ([long]$target.Size)
+    if (-not $layout.Valid) {
+        Exit-Fatal ('this device cannot take an MBR layout: ' + ($layout.Errors -join '; '))
+    }
+    Write-Host (Format-WtgLayout -Plan $layout)
+    Write-Note 'MBR: the active FAT32 partition holds \bootmgr and \Boot\BCD'
+    Write-Note 'the master and volume boot records are written after the image is applied'
 }
 else {
     $layout = New-WtgLayoutPlan -DiskSize ([long]$target.Size)
@@ -564,6 +593,14 @@ $progress = {
     }
 }
 
+# The medium also carries the deployment copy of bootsect.exe; use that rather
+# than relying on the WinPE build having one on PATH.
+$bootsectPath = 'bootsect.exe'
+if ($firmwareMode -eq 'Bios') {
+    $mediaBootsect = $imageSet.DriveLetter + ':\boot\bootsect.exe'
+    if (Test-Path -LiteralPath $mediaBootsect) { $bootsectPath = $mediaBootsect }
+}
+
 $result = $null
 try {
     $installMode = 'Fresh'
@@ -572,11 +609,15 @@ try {
         $installMode = 'SingleUsb'
         $windowsPartitionNumber = $script:SingleUsbCheck.WindowsPartition
     }
+    elseif ($firmwareMode -eq 'Bios') {
+        $installMode = 'Legacy'
+    }
 
     $result = Invoke-WtgInstall -Disk $target -Authorization $authorization -Policy $policy `
         -ImagePath $imageSet.ImagePath -SwmPath $imageSet.SwmPath -ImageIndex $chosenEdition.Index `
         -WorkDirectory $workDirectory -DriverDirectory $DriverDirectory -JournalPath $LogPath `
-        -Mode $installMode -WindowsPartitionNumber $windowsPartitionNumber -OnProgress $progress
+        -Firmware $firmwareMode -Mode $installMode -WindowsPartitionNumber $windowsPartitionNumber `
+        -BootsectPath $bootsectPath -OnProgress $progress
 }
 catch {
     Write-Host ''
@@ -611,7 +652,16 @@ Write-Head 'Installation complete'
 Write-Host '  Windows is installed on the external disk and is independently bootable.' -ForegroundColor Green
 Write-Host ''
 Write-Host '  Next steps' -ForegroundColor White
-if ($SingleUsb) {
+if ($firmwareMode -eq 'Bios') {
+    Write-Host '    1. Remove the installer medium.'
+    Write-Host '    2. Keep the target disk connected and start it from the BIOS/legacy boot menu:'
+    Write-Host '       on a Chromebook with RW_LEGACY firmware, press Ctrl+L at the white screen.'
+    Write-Host '    3. Windows will finish setup (language, account, licence) on first boot.'
+    Write-Host ''
+    Write-Host '  This disk is MBR and will not appear in a UEFI boot menu. That is expected:' -ForegroundColor Yellow
+    Write-Host '  its Boot Manager is \bootmgr, which only BIOS firmware can start.' -ForegroundColor Yellow
+}
+elseif ($SingleUsb) {
     Write-Host '    1. Keep this device connected and reboot, choosing it in the one-time boot'
     Write-Host '       menu (usually F12, F9, F10 or Esc).'
 }
